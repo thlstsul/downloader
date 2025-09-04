@@ -20,12 +20,12 @@ use tokio::time::sleep;
 /// 从HTTP响应头中提取文件名
 fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str) -> String {
     // 首先尝试从 Content-Disposition 头中提取文件名
-    if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION) {
-        if let Ok(disposition_str) = content_disposition.to_str() {
-            let parsed = content_disposition::parse_content_disposition(disposition_str);
-            if let Some(filename) = parsed.filename() {
-                return filename.0;
-            }
+    if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION)
+        && let Ok(disposition_str) = content_disposition.to_str()
+    {
+        let parsed = content_disposition::parse_content_disposition(disposition_str);
+        if let Some(filename) = parsed.filename() {
+            return filename.0;
         }
     }
 
@@ -38,14 +38,15 @@ fn extract_filename_from_url(url: &str) -> String {
     // 尝试从URL路径中提取文件名
     if let Ok(parsed_url) = url::Url::parse(url) {
         let path = parsed_url.path();
-        if let Some(filename) = path.split('/').last() {
-            if !filename.is_empty() && filename != "/" {
-                // 解码URL编码的文件名
-                if let Ok(decoded) = urlencoding::decode(filename) {
-                    return decoded.to_string();
-                }
-                return filename.to_string();
+        if let Some(filename) = path.split('/').next_back()
+            && !filename.is_empty()
+            && filename != "/"
+        {
+            // 解码URL编码的文件名
+            if let Ok(decoded) = urlencoding::decode(filename) {
+                return decoded.to_string();
             }
+            return filename.to_string();
         }
     }
 
@@ -574,10 +575,10 @@ impl DownloadTask {
         self.pause_notify.notify_waiters(); // 通知所有等待的任务
 
         // 保存暂停状态（只有在文件名已设置时才保存）
-        if self.output_path.lock().is_some() {
-            if let Err(e) = self.save_state() {
-                error!("保存暂停状态失败: {}", e);
-            }
+        if self.output_path.lock().is_some()
+            && let Err(e) = self.save_state()
+        {
+            error!("保存暂停状态失败: {}", e);
         }
     }
 
