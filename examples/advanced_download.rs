@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 添加下载任务
     let task_id = manager.add_task(
         "https://httpbin.org/bytes/5242880".to_string(), // 5MB 测试文件
-        PathBuf::from("advanced_download.bin"),
+        PathBuf::from("."),
         config.clone(),
     );
 

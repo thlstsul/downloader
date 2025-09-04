@@ -17,6 +17,42 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::sleep;
 
+/// 从HTTP响应头中提取文件名
+fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str) -> String {
+    // 首先尝试从 Content-Disposition 头中提取文件名
+    if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION) {
+        if let Ok(disposition_str) = content_disposition.to_str() {
+            let parsed = content_disposition::parse_content_disposition(disposition_str);
+            if let Some(filename) = parsed.filename() {
+                return filename.0;
+            }
+        }
+    }
+
+    // 如果Content-Disposition中没有文件名，从URL路径中提取
+    extract_filename_from_url(url)
+}
+
+/// 从URL中提取文件名
+fn extract_filename_from_url(url: &str) -> String {
+    // 尝试从URL路径中提取文件名
+    if let Ok(parsed_url) = url::Url::parse(url) {
+        let path = parsed_url.path();
+        if let Some(filename) = path.split('/').last() {
+            if !filename.is_empty() && filename != "/" {
+                // 解码URL编码的文件名
+                if let Ok(decoded) = urlencoding::decode(filename) {
+                    return decoded.to_string();
+                }
+                return filename.to_string();
+            }
+        }
+    }
+
+    // 如果无法从URL提取，使用默认文件名
+    "downloaded_file".to_string()
+}
+
 /// 下载器错误类型
 #[derive(Error, Debug)]
 pub enum DownloadError {
@@ -111,7 +147,8 @@ pub struct DownloadState {
 /// 下载任务
 pub struct DownloadTask {
     pub url: String,
-    pub output_path: PathBuf,
+    pub download_dir: PathBuf,
+    pub output_path: Arc<Mutex<Option<PathBuf>>>,
     pub config: DownloadConfig,
     pub status: Arc<Mutex<DownloadStatus>>,
     pub stats: Arc<Mutex<DownloadStats>>,
@@ -119,18 +156,20 @@ pub struct DownloadTask {
     pub is_paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
     pub state_sender: Sender<DownloadState>,
-    pub state_file_path: PathBuf,
+    pub state_file_path: Arc<Mutex<PathBuf>>,
 }
 
 impl DownloadTask {
     /// 创建新的下载任务
-    pub fn new(url: String, output_path: PathBuf, config: DownloadConfig) -> Self {
+    pub fn new(url: String, download_dir: PathBuf, config: DownloadConfig) -> Self {
         let (state_sender, _) = bounded(10);
-        let state_file_path = Self::get_state_file_path(output_path.as_path());
+        // 文件名将在start方法中从响应头中提取
+        let state_file_path = download_dir.join("temp_download_state");
 
         Self {
             url,
-            output_path,
+            download_dir,
+            output_path: Arc::new(Mutex::new(None)),
             config,
             status: Arc::new(Mutex::new(DownloadStatus::Pending)),
             stats: Arc::new(Mutex::new(DownloadStats {
@@ -145,7 +184,7 @@ impl DownloadTask {
             is_paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
             state_sender,
-            state_file_path,
+            state_file_path: Arc::new(Mutex::new(state_file_path)),
         }
     }
 
@@ -170,6 +209,16 @@ impl DownloadTask {
                     stats.chunks = state.chunks;
                 }
 
+                // 使用状态文件中保存的输出路径
+                {
+                    let mut output_path = task.output_path.lock();
+                    *output_path = Some(state.output_path.clone());
+                }
+                {
+                    let mut state_file_path = task.state_file_path.lock();
+                    *state_file_path = Self::get_state_file_path(state.output_path.as_path());
+                }
+
                 info!("从状态文件恢复下载，已下载: {} bytes", {
                     let stats = task.stats.lock();
                     stats.downloaded
@@ -178,8 +227,14 @@ impl DownloadTask {
 
                 // 下载完成后删除状态文件
                 if result.is_ok() {
-                    let _ = fs::remove_file(&task.state_file_path);
+                    let _ = fs::remove_file(task.get_current_state_file_path());
                 }
+                return;
+            }
+
+            // 确保下载目录存在
+            if let Err(e) = fs::create_dir_all(&task.download_dir) {
+                *task.status.lock() = DownloadStatus::Failed(format!("创建目录失败: {}", e));
                 return;
             }
 
@@ -196,6 +251,20 @@ impl DownloadTask {
             if !response.status().is_success() {
                 *task.status.lock() = DownloadStatus::Failed("HTTP request failed".to_string());
                 return;
+            }
+
+            // 从响应头中提取文件名
+            let filename = extract_filename_from_headers(response.headers(), &task.url);
+            let output_path = task.download_dir.join(filename);
+
+            // 更新输出路径
+            {
+                let mut output_path_guard = task.output_path.lock();
+                *output_path_guard = Some(output_path.clone());
+            }
+            {
+                let mut state_file_path = task.state_file_path.lock();
+                *state_file_path = Self::get_state_file_path(output_path.as_path());
             }
 
             let total_size = response
@@ -223,7 +292,7 @@ impl DownloadTask {
 
             // 下载完成后删除状态文件
             if result.is_ok() {
-                let _ = fs::remove_file(&task.state_file_path);
+                let _ = fs::remove_file(task.get_current_state_file_path());
                 *task.status.lock() = DownloadStatus::Completed;
             } else {
                 *task.status.lock() = DownloadStatus::Failed("Download failed".to_string());
@@ -390,11 +459,17 @@ impl DownloadTask {
 
         let mut response = request.send().await?;
 
+        let output_path = self
+            .output_path
+            .lock()
+            .as_ref()
+            .ok_or_else(|| DownloadError::Other("Output path not set".to_string()))?
+            .clone();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&self.output_path)
+            .open(output_path)
             .await?;
 
         let start_time = Instant::now();
@@ -498,9 +573,11 @@ impl DownloadTask {
         self.is_paused.store(true, Ordering::Relaxed);
         self.pause_notify.notify_waiters(); // 通知所有等待的任务
 
-        // 保存暂停状态
-        if let Err(e) = self.save_state() {
-            error!("保存暂停状态失败: {}", e);
+        // 保存暂停状态（只有在文件名已设置时才保存）
+        if self.output_path.lock().is_some() {
+            if let Err(e) = self.save_state() {
+                error!("保存暂停状态失败: {}", e);
+            }
         }
     }
 
@@ -517,7 +594,7 @@ impl DownloadTask {
         self.is_cancelled.store(true, Ordering::Relaxed);
 
         // 删除状态文件
-        let _ = fs::remove_file(&self.state_file_path);
+        let _ = fs::remove_file(self.get_current_state_file_path());
     }
 
     /// 获取下载状态
@@ -543,6 +620,11 @@ impl DownloadTask {
         state_path
     }
 
+    /// 获取当前状态文件路径
+    fn get_current_state_file_path(&self) -> PathBuf {
+        self.state_file_path.lock().clone()
+    }
+
     /// 保存下载状态到文件
     fn save_state(&self) -> Result<(), DownloadError> {
         // 获取统计信息时只获取一次锁，避免死锁
@@ -550,30 +632,44 @@ impl DownloadTask {
         let total_size = stats.total_size;
         let chunks = stats.chunks.clone();
 
+        let output_path = self
+            .output_path
+            .lock()
+            .as_ref()
+            .ok_or_else(|| DownloadError::Other("Output path not set".to_string()))?
+            .clone();
+
         let state = DownloadState {
             url: self.url.clone(),
-            output_path: self.output_path.clone(),
+            output_path: output_path.clone(),
             total_size,
             chunks,
             config: self.config.clone(),
         };
 
         let state_json = serde_json::to_string(&state)?;
-        fs::write(&self.state_file_path, state_json)?;
+        fs::write(self.get_current_state_file_path(), state_json)?;
         Ok(())
     }
 
     /// 从文件加载下载状态
     fn load_state(&self) -> Result<DownloadState, DownloadError> {
-        if !self.state_file_path.exists() {
+        let state_file_path = self.get_current_state_file_path();
+        if !state_file_path.exists() {
             return Err(DownloadError::InvalidStateFile);
         }
 
-        let state_json = fs::read_to_string(&self.state_file_path)?;
+        let state_json = fs::read_to_string(&state_file_path)?;
         let state: DownloadState = serde_json::from_str(&state_json)?;
 
         // 验证状态文件的有效性
-        if state.url != self.url || state.output_path != self.output_path {
+        let current_output_path = self
+            .output_path
+            .lock()
+            .as_ref()
+            .ok_or_else(|| DownloadError::InvalidStateFile)?
+            .clone();
+        if state.url != self.url || state.output_path != current_output_path {
             return Err(DownloadError::InvalidStateFile);
         }
 
@@ -584,6 +680,7 @@ impl DownloadTask {
     fn clone_arc(&self) -> Arc<Self> {
         Arc::new(Self {
             url: self.url.clone(),
+            download_dir: self.download_dir.clone(),
             output_path: self.output_path.clone(),
             config: self.config.clone(),
             status: self.status.clone(),
@@ -613,9 +710,9 @@ impl DownloadManager {
     }
 
     /// 添加下载任务
-    pub fn add_task(&self, url: String, output_path: PathBuf, config: DownloadConfig) -> String {
+    pub fn add_task(&self, url: String, download_dir: PathBuf, config: DownloadConfig) -> String {
         let task_id = uuid::Uuid::new_v4().to_string();
-        let task = Arc::new(DownloadTask::new(url, output_path, config));
+        let task = Arc::new(DownloadTask::new(url, download_dir, config));
 
         self.tasks.lock().insert(task_id.clone(), task);
         task_id
@@ -679,23 +776,23 @@ mod tests {
     async fn test_download_task_creation() {
         let task = DownloadTask::new(
             "https://example.com/file.txt".to_string(),
-            PathBuf::from("test.txt"),
+            PathBuf::from("."),
             DownloadConfig::default(),
         );
 
         assert_eq!(task.url, "https://example.com/file.txt");
-        assert_eq!(task.output_path, PathBuf::from("test.txt"));
+        assert_eq!(task.download_dir, PathBuf::from("."));
+        assert!(task.output_path.lock().is_none());
     }
 
     #[tokio::test]
     async fn test_download_manager() {
         let manager = DownloadManager::new();
         let temp_dir = tempdir().unwrap();
-        let output_path = temp_dir.path().join("test.txt");
 
         let task_id = manager.add_task(
             "https://httpbin.org/bytes/1024".to_string(),
-            output_path,
+            temp_dir.path().to_path_buf(),
             DownloadConfig {
                 max_connections: 1,
                 chunk_size: 512,

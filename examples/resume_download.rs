@@ -24,17 +24,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 添加下载任务 - 使用httpbin的测试文件
-    let output_path = PathBuf::from("Firefox.msi");
+    let download_dir = PathBuf::from(".");
     // https://httpbin.org/range/102400
     // https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi
     let task_id = manager.add_task(
-        "https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi".to_string(), // 100KB 测试文件
-        output_path.clone(),
+        "https://httpbin.org/range/102400".to_string(), // 100KB 测试文件
+        download_dir.clone(),
         config,
     );
 
     log::info!("任务ID: {}", task_id);
-    log::info!("输出文件: {:?}", output_path);
+    log::info!("下载目录: {:?}", download_dir);
     log::info!("启用断点续传功能");
 
     // 开始下载
@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 检查状态文件是否已删除
+    let output_path = download_dir.join("102400");
     let state_file_path = output_path.with_extension("download_state");
     if !state_file_path.exists() {
         log::info!("状态文件已自动删除");
@@ -140,8 +141,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = std::fs::remove_file(state_file_path);
     }
 
-    // 清理下载的文件
-    let _ = std::fs::remove_file(output_path);
+    // 清理下载的文件（如果存在）
+    if output_path.exists() {
+        let _ = std::fs::remove_file(output_path);
+    }
 
     Ok(())
 }
