@@ -193,8 +193,6 @@ impl DownloadTask {
                 }
             };
 
-            info!("head响应：{:?}", response);
-
             if !response.status().is_success() {
                 *task.status.lock() = DownloadStatus::Failed("HTTP request failed".to_string());
                 return;
@@ -282,7 +280,6 @@ impl DownloadTask {
 
     /// 下载所有块
     async fn download_chunks(&self, client: &Client) -> Result<(), DownloadError> {
-        info!("下载所有块");
         let semaphore = Arc::new(Semaphore::new(self.config.max_connections));
         let mut handles = Vec::new();
 
@@ -617,7 +614,7 @@ impl DownloadManager {
 
     /// 添加下载任务
     pub fn add_task(&self, url: String, output_path: PathBuf, config: DownloadConfig) -> String {
-        let task_id = format!("{:x}", rand::random::<u64>());
+        let task_id = uuid::Uuid::new_v4().to_string();
         let task = Arc::new(DownloadTask::new(url, output_path, config));
 
         self.tasks.lock().insert(task_id.clone(), task);
