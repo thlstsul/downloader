@@ -158,14 +158,14 @@ pub struct DownloadTask {
     pub pause_notify: Arc<Notify>,
     pub state_sender: Sender<DownloadState>,
     pub state_file_path: Arc<Mutex<PathBuf>>,
+    pub supports_range: Arc<AtomicBool>,
 }
 
 impl DownloadTask {
     /// 创建新的下载任务
     pub fn new(url: String, download_dir: PathBuf, config: DownloadConfig) -> Self {
         let (state_sender, _) = bounded(10);
-        // 文件名将在start方法中从响应头中提取
-        let state_file_path = download_dir.join("temp_download_state");
+        let state_file_path = Arc::new(Mutex::new(download_dir.join("temp_download_state")));
 
         Self {
             url,
@@ -185,7 +185,8 @@ impl DownloadTask {
             is_paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
             state_sender,
-            state_file_path: Arc::new(Mutex::new(state_file_path)),
+            state_file_path: state_file_path,
+            supports_range: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -224,7 +225,19 @@ impl DownloadTask {
                     let stats = task.stats.lock();
                     stats.downloaded
                 });
-                let result = task.download_chunks(&Client::new()).await;
+
+                // 在恢复下载前重新检查服务器是否支持范围请求
+                let client = Client::new();
+                if let Ok(response) = client.head(&task.url).send().await {
+                    let supports_range = response
+                        .headers()
+                        .get(reqwest::header::ACCEPT_RANGES)
+                        .map(|h| h == "bytes")
+                        .unwrap_or(false);
+                    task.supports_range.store(supports_range, Ordering::Relaxed);
+                }
+
+                let result = task.download_chunks(&client).await;
 
                 // 下载完成后删除状态文件
                 if result.is_ok() {
@@ -280,6 +293,9 @@ impl DownloadTask {
                 .get(reqwest::header::ACCEPT_RANGES)
                 .map(|h| h == "bytes")
                 .unwrap_or(false);
+
+            // 保存服务器是否支持范围请求的信息
+            task.supports_range.store(supports_range, Ordering::Relaxed);
 
             // 初始化下载统计
             {
@@ -444,10 +460,7 @@ impl DownloadTask {
 
         if chunk.start <= chunk.end {
             // 检查服务器是否支持范围请求
-            let supports_range = {
-                let stats = self.stats.lock();
-                stats.chunks.len() > 1 // 如果创建了多个块，说明服务器支持范围请求
-            };
+            let supports_range = self.supports_range.load(Ordering::Relaxed);
 
             if supports_range {
                 let range_header =
@@ -468,7 +481,6 @@ impl DownloadTask {
             .clone();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
             .write(true)
             .open(output_path)
             .await?;
@@ -691,6 +703,7 @@ impl DownloadTask {
             pause_notify: self.pause_notify.clone(),
             state_sender: self.state_sender.clone(),
             state_file_path: self.state_file_path.clone(),
+            supports_range: self.supports_range.clone(),
         })
     }
 }
