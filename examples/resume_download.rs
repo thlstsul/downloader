@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 清理下载的文件（如果存在）
     if output_path.exists() {
-        // let _ = std::fs::remove_file(output_path);
+        let _ = std::fs::remove_file(output_path);
     }
 
     Ok(())

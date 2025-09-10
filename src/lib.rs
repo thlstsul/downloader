@@ -10,6 +10,7 @@ use crossbeam::channel::{Sender, bounded};
 use log::{error, info};
 use parking_lot::Mutex;
 use reqwest::Client;
+use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use thiserror::Error;
@@ -121,6 +122,7 @@ pub struct DownloadConfig {
     pub speed_limit: Option<u64>, // bytes per second
     pub temp_dir: Option<PathBuf>,
     pub auto_resume: bool,
+    pub cookies: Option<String>,
 }
 
 impl Default for DownloadConfig {
@@ -131,6 +133,7 @@ impl Default for DownloadConfig {
             speed_limit: None,
             temp_dir: None,
             auto_resume: true,
+            cookies: None,
         }
     }
 }
@@ -185,7 +188,7 @@ impl DownloadTask {
             is_paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
             state_sender,
-            state_file_path: state_file_path,
+            state_file_path,
             supports_range: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -205,21 +208,7 @@ impl DownloadTask {
             if task.config.auto_resume
                 && let Ok(state) = task.load_state()
             {
-                {
-                    let mut stats = task.stats.lock();
-                    stats.total_size = state.total_size;
-                    stats.chunks = state.chunks;
-                }
-
-                // 使用状态文件中保存的输出路径
-                {
-                    let mut output_path = task.output_path.lock();
-                    *output_path = Some(state.output_path.clone());
-                }
-                {
-                    let mut state_file_path = task.state_file_path.lock();
-                    *state_file_path = Self::get_state_file_path(state.output_path.as_path());
-                }
+                task.restore_state_from_file(&state);
 
                 info!("从状态文件恢复下载，已下载: {} bytes", {
                     let stats = task.stats.lock();
@@ -227,15 +216,16 @@ impl DownloadTask {
                 });
 
                 // 在恢复下载前重新检查服务器是否支持范围请求
-                let client = Client::new();
-                if let Ok(response) = client.head(&task.url).send().await {
-                    let supports_range = response
-                        .headers()
-                        .get(reqwest::header::ACCEPT_RANGES)
-                        .map(|h| h == "bytes")
-                        .unwrap_or(false);
-                    task.supports_range.store(supports_range, Ordering::Relaxed);
-                }
+                let client = match task.build_client() {
+                    Ok(client) => client,
+                    Err(e) => {
+                        *task.status.lock() =
+                            DownloadStatus::Failed(format!("Failed to build HTTP client: {}", e));
+                        return;
+                    }
+                };
+                let supports_range = task.check_range_support(&client).await;
+                task.supports_range.store(supports_range, Ordering::Relaxed);
 
                 let result = task.download_chunks(&client).await;
 
@@ -252,49 +242,35 @@ impl DownloadTask {
                 return;
             }
 
-            let client = Client::new();
+            let client = match task.build_client() {
+                Ok(client) => client,
+                Err(e) => {
+                    *task.status.lock() =
+                        DownloadStatus::Failed(format!("Failed to build HTTP client: {}", e));
+                    return;
+                }
+            };
             let response = match client.head(&task.url).send().await {
                 Ok(resp) => resp,
                 Err(e) => {
                     *task.status.lock() =
-                        DownloadStatus::Failed(format!("HTTP request failed: {}", e));
+                        DownloadStatus::Failed(format!("HTTP HEAD request failed: {}", e));
                     return;
                 }
             };
 
             if !response.status().is_success() {
-                *task.status.lock() = DownloadStatus::Failed("HTTP request failed".to_string());
+                *task.status.lock() = DownloadStatus::Failed(format!(
+                    "HTTP HEAD request failed with status: {}",
+                    response.status()
+                ));
                 return;
             }
 
-            // 从响应头中提取文件名
-            let filename = extract_filename_from_headers(response.headers(), &task.url);
-            let output_path = task.download_dir.join(filename);
+            // 从响应头中提取文件名并设置输出路径
+            task.setup_output_path(response.headers(), &task.url);
 
-            // 更新输出路径
-            {
-                let mut output_path_guard = task.output_path.lock();
-                *output_path_guard = Some(output_path.clone());
-            }
-            {
-                let mut state_file_path = task.state_file_path.lock();
-                *state_file_path = Self::get_state_file_path(output_path.as_path());
-            }
-
-            let total_size = response
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|ct_len| ct_len.to_str().ok())
-                .and_then(|ct_len| ct_len.parse().ok())
-                .unwrap_or(0);
-
-            let supports_range = response
-                .headers()
-                .get(reqwest::header::ACCEPT_RANGES)
-                .map(|h| h == "bytes")
-                .unwrap_or(false);
-
-            // 保存服务器是否支持范围请求的信息
+            let (total_size, supports_range) = task.extract_response_info(response.headers());
             task.supports_range.store(supports_range, Ordering::Relaxed);
 
             // 初始化下载统计
@@ -317,6 +293,80 @@ impl DownloadTask {
         });
 
         Ok(())
+    }
+
+    /// 设置输出路径和状态文件路径
+    fn setup_output_path(&self, headers: &HeaderMap, url: &str) {
+        let filename = extract_filename_from_headers(headers, url);
+        let output_path = self.download_dir.join(filename);
+
+        // 更新输出路径
+        {
+            let mut output_path_guard = self.output_path.lock();
+            *output_path_guard = Some(output_path.clone());
+        }
+        {
+            let mut state_file_path = self.state_file_path.lock();
+            *state_file_path = Self::get_state_file_path(output_path.as_path());
+        }
+    }
+
+    /// 构建带有配置的 HTTP 客户端
+    fn build_client(&self) -> Result<Client, DownloadError> {
+        let mut client_builder = Client::builder();
+        if let Some(ref cookies) = self.config.cookies
+            && let Ok(cookies) = HeaderValue::from_str(cookies)
+        {
+            let mut cookie_header = HeaderMap::new();
+            cookie_header.insert(COOKIE, cookies);
+            client_builder = client_builder.default_headers(cookie_header);
+        }
+        client_builder
+            .build()
+            .map_err(|e| DownloadError::Other(format!("Failed to build client: {}", e)))
+    }
+
+    /// 从状态文件恢复状态
+    fn restore_state_from_file(&self, state: &DownloadState) {
+        {
+            let mut stats = self.stats.lock();
+            stats.total_size = state.total_size;
+            stats.chunks = state.chunks.clone();
+        }
+
+        // 使用状态文件中保存的输出路径
+        {
+            let mut output_path = self.output_path.lock();
+            *output_path = Some(state.output_path.clone());
+        }
+        {
+            let mut state_file_path = self.state_file_path.lock();
+            *state_file_path = Self::get_state_file_path(state.output_path.as_path());
+        }
+    }
+
+    /// 从响应头中提取总大小和范围支持信息
+    fn extract_response_info(&self, headers: &HeaderMap) -> (u64, bool) {
+        let total_size = headers
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|ct_len| ct_len.to_str().ok())
+            .and_then(|ct_len| ct_len.parse().ok())
+            .unwrap_or(0);
+
+        let supports_range = headers
+            .get(reqwest::header::ACCEPT_RANGES)
+            .map(|h| h == "bytes")
+            .unwrap_or(false);
+
+        (total_size, supports_range)
+    }
+
+    /// 检查服务器是否支持范围请求
+    async fn check_range_support(&self, client: &Client) -> bool {
+        match client.head(&self.url).send().await {
+            Ok(response) => self.extract_response_info(response.headers()).1,
+            Err(_) => false,
+        }
     }
 
     /// 创建下载块
