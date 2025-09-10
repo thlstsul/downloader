@@ -205,6 +205,7 @@ impl DownloadTask {
         let task = self.clone_arc();
         tokio::spawn(async move {
             // 尝试从状态文件恢复
+            let mut is_resume = false;
             if task.config.auto_resume
                 && let Ok(state) = task.load_state()
             {
@@ -214,32 +215,13 @@ impl DownloadTask {
                     let stats = task.stats.lock();
                     stats.downloaded
                 });
-
-                // 在恢复下载前重新检查服务器是否支持范围请求
-                let client = match task.build_client() {
-                    Ok(client) => client,
-                    Err(e) => {
-                        *task.status.lock() =
-                            DownloadStatus::Failed(format!("Failed to build HTTP client: {}", e));
-                        return;
-                    }
-                };
-                let supports_range = task.check_range_support(&client).await;
-                task.supports_range.store(supports_range, Ordering::Relaxed);
-
-                let result = task.download_chunks(&client).await;
-
-                // 下载完成后删除状态文件
-                if result.is_ok() {
-                    let _ = fs::remove_file(task.get_current_state_file_path());
+                is_resume = true;
+            } else {
+                // 确保下载目录存在
+                if let Err(e) = fs::create_dir_all(&task.download_dir) {
+                    *task.status.lock() = DownloadStatus::Failed(format!("创建目录失败: {}", e));
+                    return;
                 }
-                return;
-            }
-
-            // 确保下载目录存在
-            if let Err(e) = fs::create_dir_all(&task.download_dir) {
-                *task.status.lock() = DownloadStatus::Failed(format!("创建目录失败: {}", e));
-                return;
             }
 
             let client = match task.build_client() {
@@ -267,14 +249,16 @@ impl DownloadTask {
                 return;
             }
 
-            // 从响应头中提取文件名并设置输出路径
-            task.setup_output_path(response.headers(), &task.url);
+            if !is_resume {
+                // 从响应头中提取文件名并设置输出路径
+                task.setup_output_path(response.headers(), &task.url);
+            }
 
             let (total_size, supports_range) = task.extract_response_info(response.headers());
             task.supports_range.store(supports_range, Ordering::Relaxed);
 
-            // 初始化下载统计
-            {
+            if !is_resume || !supports_range {
+                // 初始化下载统计
                 let mut stats = task.stats.lock();
                 stats.total_size = total_size;
                 stats.chunks = task.create_chunks(total_size, supports_range);
@@ -359,14 +343,6 @@ impl DownloadTask {
             .unwrap_or(false);
 
         (total_size, supports_range)
-    }
-
-    /// 检查服务器是否支持范围请求
-    async fn check_range_support(&self, client: &Client) -> bool {
-        match client.head(&self.url).send().await {
-            Ok(response) => self.extract_response_info(response.headers()).1,
-            Err(_) => false,
-        }
     }
 
     /// 创建下载块
@@ -531,13 +507,13 @@ impl DownloadTask {
             .clone();
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(output_path)
             .await?;
 
         let start_time = Instant::now();
         let mut last_update = Instant::now();
-        let mut _last_downloaded = chunk.downloaded;
 
         while let Some(chunk_data) = response.chunk().await? {
             if self.is_cancelled.load(Ordering::Relaxed) {
@@ -597,7 +573,6 @@ impl DownloadTask {
             }
 
             last_update = Instant::now();
-            _last_downloaded = chunk.downloaded;
 
             // 定期保存状态（每下载1MB保存一次）
             // 注意：在持有 stats 锁时不能调用 save_state，否则会导致死锁
