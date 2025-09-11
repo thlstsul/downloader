@@ -1,12 +1,15 @@
 use downloader::{DownloadConfig, DownloadManager, DownloadStatus};
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::fs;
 use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日志
-    env_logger::init();
+    // 初始化日志，设置日志级别为 info
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 
     log::info!("断点续传示例");
     log::info!("==============");
@@ -18,8 +21,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = DownloadConfig {
         max_connections: 4,
         chunk_size: 512 * 1024, // 512KB
-        speed_limit: None,      // 500KB/s 限速
-        auto_resume: true,      // 启用断点续传
+        speed_limit: None,
+        auto_resume: true, // 启用断点续传
         ..Default::default()
     };
 
@@ -27,11 +30,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let download_dir = PathBuf::from(".");
     // https://httpbin.org/range/102400
     // https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi
-    let task_id = manager.add_task(
-        "https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi".to_string(), // 100KB 测试文件
-        download_dir.clone(),
-        config,
-    );
+    let task_id = manager
+        .add_task(
+            "https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi".to_string(), // 100KB 测试文件
+            download_dir.clone(),
+            config,
+        )
+        .await;
 
     log::info!("任务ID: {}", task_id);
     log::info!("下载目录: {:?}", download_dir);
@@ -45,14 +50,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 等待一段时间让下载开始
-    sleep(Duration::from_millis(50)).await;
+    sleep(Duration::from_secs(2)).await;
 
     // 暂停下载
     log::info!("暂停下载...");
-    manager.pause_task(&task_id);
+    manager.pause_task(&task_id).await;
 
     // 显示暂停时的状态
-    if let Some(stats) = manager.get_task_stats(&task_id) {
+    if let Some(stats) = manager.get_task_stats(&task_id).await {
         let progress = if stats.total_size > 0 {
             (stats.downloaded as f64 / stats.total_size as f64) * 100.0
         } else {
@@ -67,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sleep(Duration::from_secs(2)).await;
 
     log::info!("恢复下载...");
-    manager.resume_task(&task_id);
+    manager.resume_task(&task_id).await;
 
     // 恢复下载后不需要重新调用 start_task，resume_task 已经恢复下载
 
@@ -76,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         sleep(Duration::from_secs(1)).await;
 
-        if let Some(stats) = manager.get_task_stats(&task_id) {
+        if let Some(stats) = manager.get_task_stats(&task_id).await {
             let progress = if stats.total_size > 0 {
                 (stats.downloaded as f64 / stats.total_size as f64) * 100.0
             } else {
@@ -97,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        if let Some(status) = manager.get_task_status(&task_id) {
+        if let Some(status) = manager.get_task_status(&task_id).await {
             if let DownloadStatus::Completed = status {
                 log::info!("下载完成!");
                 break;
@@ -106,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 显示最终统计信息
-    if let Some(stats) = manager.get_task_stats(&task_id) {
+    if let Some(stats) = manager.get_task_stats(&task_id).await {
         log::info!("最终统计:");
         log::info!("总大小: {} bytes", stats.total_size);
         log::info!("下载耗时: {:?}", stats.elapsed);
@@ -133,17 +138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 检查状态文件是否已删除
     let output_path = download_dir.join("Firefox Setup 139.0.4.msi");
     let state_file_path = output_path.with_extension("download_state");
-    if !state_file_path.exists() {
+    if fs::metadata(&state_file_path).await.is_err() {
         log::info!("状态文件已自动删除");
     } else {
         log::warn!("状态文件仍然存在: {:?}", state_file_path);
         // 清理状态文件
-        let _ = std::fs::remove_file(state_file_path);
+        let _ = fs::remove_file(state_file_path).await;
     }
 
     // 清理下载的文件（如果存在）
-    if output_path.exists() {
-        let _ = std::fs::remove_file(output_path);
+    if fs::metadata(&output_path).await.is_ok() {
+        // let _ = fs::remove_file(output_path).await;
+        // log::info!("下载文件已自动删除");
     }
 
     Ok(())

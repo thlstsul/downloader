@@ -23,11 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 添加下载任务
-    let task_id = manager.add_task(
-        "https://httpbin.org/bytes/10485760".to_string(), // 10MB 测试文件
-        PathBuf::from("."),
-        config,
-    );
+    let task_id = manager
+        .add_task(
+            "https://httpbin.org/bytes/10485760".to_string(), // 10MB 测试文件
+            PathBuf::from("."),
+            config,
+        )
+        .await;
 
     log::info!("任务ID: {}", task_id);
 
@@ -42,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         sleep(Duration::from_secs(1)).await;
 
-        if let Some(stats) = manager.get_task_stats(&task_id) {
+        if let Some(stats) = manager.get_task_stats(&task_id).await {
             let speed_mb = stats.speed / 1024.0 / 1024.0;
             let progress = if stats.total_size > 0 {
                 (stats.downloaded as f64 / stats.total_size as f64) * 100.0
@@ -68,16 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 检查是否卡住
             if stats.downloaded == last_downloaded && stats.downloaded > 0 {
                 log::warn!("下载似乎卡住了，尝试重新开始...");
-                manager.pause_task(&task_id);
+                manager.pause_task(&task_id).await;
                 sleep(Duration::from_secs(1)).await;
-                manager.resume_task(&task_id);
+                manager.resume_task(&task_id).await;
             }
 
             last_downloaded = stats.downloaded;
         }
 
         // 检查任务状态
-        if let Some(status) = manager.get_task_status(&task_id) {
+        if let Some(status) = manager.get_task_status(&task_id).await {
             match status {
                 downloader::DownloadStatus::Completed => {
                     log::info!("下载完成!");

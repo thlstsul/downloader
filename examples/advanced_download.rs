@@ -6,7 +6,9 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 初始化日志
-    env_logger::init();
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .init();
 
     log::info!("高级下载示例 - 动态配置修改演示");
     log::info!("==================================");
@@ -24,11 +26,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 添加下载任务
-    let task_id = manager.add_task(
-        "https://httpbin.org/bytes/5242880".to_string(), // 5MB 测试文件
-        PathBuf::from("."),
-        config.clone(),
-    );
+    let task_id = manager
+        .add_task(
+            "https://httpbin.org/bytes/5242880".to_string(), // 5MB 测试文件
+            PathBuf::from("."),
+            config.clone(),
+        )
+        .await;
 
     log::info!("任务ID: {}", task_id);
     log::info!(
@@ -50,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         sleep(Duration::from_secs(1)).await;
 
-        if let Some(stats) = manager.get_task_stats(&task_id) {
+        if let Some(stats) = manager.get_task_stats(&task_id).await {
             let speed_kb = stats.speed / 1024.0;
             let progress = if stats.total_size > 0 {
                 (stats.downloaded as f64 / stats.total_size as f64) * 100.0
@@ -58,9 +62,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 0.0
             };
 
-            println!(
+            log::info!(
                 "进度: {:5.1}% | 速度: {:6.1} KB/s | 已下载: {}/{} bytes",
-                progress, speed_kb, stats.downloaded, stats.total_size
+                progress,
+                speed_kb,
+                stats.downloaded,
+                stats.total_size
             );
 
             // 动态调整配置
@@ -108,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 检查任务状态
-        if let Some(status) = manager.get_task_status(&task_id) {
+        if let Some(status) = manager.get_task_status(&task_id).await {
             match status {
                 DownloadStatus::Completed => {
                     log::info!("下载完成!");
@@ -128,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 显示最终统计信息
-    if let Some(stats) = manager.get_task_stats(&task_id) {
+    if let Some(stats) = manager.get_task_stats(&task_id).await {
         log::info!("下载统计:");
         log::info!("总大小: {} bytes", stats.total_size);
         log::info!("下载耗时: {:?}", stats.elapsed);

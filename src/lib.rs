@@ -5,16 +5,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam::channel::{Sender, bounded};
-
 use log::{error, info};
-use parking_lot::Mutex;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
-use std::fs;
 use thiserror::Error;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::sleep;
 
@@ -129,7 +126,7 @@ impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
             max_connections: 4,
-            chunk_size: 1024 * 1024, // 1MB
+            chunk_size: 0, // 0表示自动计算块大小
             speed_limit: None,
             temp_dir: None,
             auto_resume: true,
@@ -159,7 +156,6 @@ pub struct DownloadTask {
     pub is_cancelled: Arc<AtomicBool>,
     pub is_paused: Arc<AtomicBool>,
     pub pause_notify: Arc<Notify>,
-    pub state_sender: Sender<DownloadState>,
     pub state_file_path: Arc<Mutex<PathBuf>>,
     pub supports_range: Arc<AtomicBool>,
 }
@@ -167,7 +163,6 @@ pub struct DownloadTask {
 impl DownloadTask {
     /// 创建新的下载任务
     pub fn new(url: String, download_dir: PathBuf, config: DownloadConfig) -> Self {
-        let (state_sender, _) = bounded(10);
         let state_file_path = Arc::new(Mutex::new(download_dir.join("temp_download_state")));
 
         Self {
@@ -187,7 +182,6 @@ impl DownloadTask {
             is_cancelled: Arc::new(AtomicBool::new(false)),
             is_paused: Arc::new(AtomicBool::new(false)),
             pause_notify: Arc::new(Notify::new()),
-            state_sender,
             state_file_path,
             supports_range: Arc::new(AtomicBool::new(false)),
         }
@@ -195,39 +189,19 @@ impl DownloadTask {
 
     /// 开始下载
     pub async fn start(&self) -> Result<(), DownloadError> {
-        if let DownloadStatus::Downloading = *self.status.lock() {
+        if let DownloadStatus::Downloading = *self.status.lock().await {
             return Ok(()); // 已经在下载中
         }
 
-        *self.status.lock() = DownloadStatus::Downloading;
+        *self.status.lock().await = DownloadStatus::Downloading;
         self.is_paused.store(false, Ordering::Relaxed);
 
         let task = self.clone_arc();
         tokio::spawn(async move {
-            // 尝试从状态文件恢复
-            let mut is_resume = false;
-            if task.config.auto_resume
-                && let Ok(state) = task.load_state()
-            {
-                task.restore_state_from_file(&state);
-
-                info!("从状态文件恢复下载，已下载: {} bytes", {
-                    let stats = task.stats.lock();
-                    stats.downloaded
-                });
-                is_resume = true;
-            } else {
-                // 确保下载目录存在
-                if let Err(e) = fs::create_dir_all(&task.download_dir) {
-                    *task.status.lock() = DownloadStatus::Failed(format!("创建目录失败: {}", e));
-                    return;
-                }
-            }
-
             let client = match task.build_client() {
                 Ok(client) => client,
                 Err(e) => {
-                    *task.status.lock() =
+                    *task.status.lock().await =
                         DownloadStatus::Failed(format!("Failed to build HTTP client: {}", e));
                     return;
                 }
@@ -235,31 +209,53 @@ impl DownloadTask {
             let response = match client.head(&task.url).send().await {
                 Ok(resp) => resp,
                 Err(e) => {
-                    *task.status.lock() =
+                    *task.status.lock().await =
                         DownloadStatus::Failed(format!("HTTP HEAD request failed: {}", e));
                     return;
                 }
             };
 
             if !response.status().is_success() {
-                *task.status.lock() = DownloadStatus::Failed(format!(
+                *task.status.lock().await = DownloadStatus::Failed(format!(
                     "HTTP HEAD request failed with status: {}",
                     response.status()
                 ));
                 return;
             }
 
-            if !is_resume {
-                // 从响应头中提取文件名并设置输出路径
-                task.setup_output_path(response.headers(), &task.url);
+            // 从响应头中提取文件名并设置输出路径
+            task.setup_output_path(&response.headers(), &task.url).await;
+
+            // 尝试从状态文件恢复
+            let mut is_resume = false;
+            if task.config.auto_resume
+                && let Ok(state) = task
+                    .load_state()
+                    .await
+                    .inspect_err(|e| error!("从状态文件恢复失败：{e}"))
+            {
+                task.restore_state_from_file(&state).await;
+
+                info!("从状态文件恢复下载，已下载: {} bytes", {
+                    let stats = task.stats.lock().await;
+                    stats.downloaded
+                });
+                is_resume = true;
+            } else {
+                // 确保下载目录存在
+                if let Err(e) = tokio::fs::create_dir_all(&task.download_dir).await {
+                    *task.status.lock().await =
+                        DownloadStatus::Failed(format!("创建目录失败: {}", e));
+                    return;
+                }
             }
 
             let (total_size, supports_range) = task.extract_response_info(response.headers());
             task.supports_range.store(supports_range, Ordering::Relaxed);
 
             if !is_resume || !supports_range {
-                // 初始化下载统计
-                let mut stats = task.stats.lock();
+                info!("初始化下载统计");
+                let mut stats = task.stats.lock().await;
                 stats.total_size = total_size;
                 stats.chunks = task.create_chunks(total_size, supports_range);
             }
@@ -269,10 +265,10 @@ impl DownloadTask {
 
             // 下载完成后删除状态文件
             if result.is_ok() {
-                let _ = fs::remove_file(task.get_current_state_file_path());
-                *task.status.lock() = DownloadStatus::Completed;
+                let _ = tokio::fs::remove_file(task.get_current_state_file_path().await).await;
+                *task.status.lock().await = DownloadStatus::Completed;
             } else {
-                *task.status.lock() = DownloadStatus::Failed("Download failed".to_string());
+                *task.status.lock().await = DownloadStatus::Failed("Download failed".to_string());
             }
         });
 
@@ -280,17 +276,17 @@ impl DownloadTask {
     }
 
     /// 设置输出路径和状态文件路径
-    fn setup_output_path(&self, headers: &HeaderMap, url: &str) {
+    async fn setup_output_path(&self, headers: &HeaderMap, url: &str) {
         let filename = extract_filename_from_headers(headers, url);
         let output_path = self.download_dir.join(filename);
 
         // 更新输出路径
         {
-            let mut output_path_guard = self.output_path.lock();
+            let mut output_path_guard = self.output_path.lock().await;
             *output_path_guard = Some(output_path.clone());
         }
         {
-            let mut state_file_path = self.state_file_path.lock();
+            let mut state_file_path = self.state_file_path.lock().await;
             *state_file_path = Self::get_state_file_path(output_path.as_path());
         }
     }
@@ -311,20 +307,20 @@ impl DownloadTask {
     }
 
     /// 从状态文件恢复状态
-    fn restore_state_from_file(&self, state: &DownloadState) {
+    async fn restore_state_from_file(&self, state: &DownloadState) {
         {
-            let mut stats = self.stats.lock();
+            let mut stats = self.stats.lock().await;
             stats.total_size = state.total_size;
             stats.chunks = state.chunks.clone();
         }
 
         // 使用状态文件中保存的输出路径
         {
-            let mut output_path = self.output_path.lock();
+            let mut output_path = self.output_path.lock().await;
             *output_path = Some(state.output_path.clone());
         }
         {
-            let mut state_file_path = self.state_file_path.lock();
+            let mut state_file_path = self.state_file_path.lock().await;
             *state_file_path = Self::get_state_file_path(state.output_path.as_path());
         }
     }
@@ -361,20 +357,18 @@ impl DownloadTask {
             }];
         }
 
-        let chunk_size = self.config.chunk_size;
+        let chunk_size = self.calculate_chunk_size(total_size);
+        info!("计算后的块大小: {} bytes", chunk_size);
+
         let mut chunks = Vec::new();
         let mut start = 0;
+        let mut index = 0;
 
-        for i in 0..self.config.max_connections {
-            let end = if i == self.config.max_connections - 1 {
-                total_size.saturating_sub(1)
-            } else {
-                start + chunk_size - 1
-            }
-            .min(total_size.saturating_sub(1));
+        while start < total_size {
+            let end = (start + chunk_size - 1).min(total_size.saturating_sub(1));
 
             chunks.push(ChunkInfo {
-                index: i,
+                index,
                 start,
                 end,
                 downloaded: 0,
@@ -382,12 +376,40 @@ impl DownloadTask {
             });
 
             start = end + 1;
-            if start >= total_size {
-                break;
-            }
+            index += 1;
         }
 
         chunks
+    }
+
+    /// 根据文件大小和线程数动态计算块大小
+    fn calculate_chunk_size(&self, total_size: u64) -> u64 {
+        // 最小块大小：100KB
+        const MIN_CHUNK_SIZE: u64 = 100 * 1024;
+        // 最大块大小：10MB
+        const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
+        // 目标块大小：1MB
+        const TARGET_CHUNK_SIZE: u64 = 1 * 1024 * 1024;
+
+        // 如果配置中指定了块大小，优先使用配置的值
+        if self.config.chunk_size > 0 {
+            return self.config.chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+        }
+
+        // 基于文件大小计算块大小
+        let chunk_size = if total_size <= 5 * 1024 * 1024 {
+            // 小文件（<=5MB）：使用固定100KB块大小
+            MIN_CHUNK_SIZE
+        } else if total_size <= 50 * 1024 * 1024 {
+            // 中等文件（5MB-50MB）：使用500KB块
+            500 * 1024
+        } else {
+            // 大文件（>50MB）：使用1MB块
+            TARGET_CHUNK_SIZE
+        };
+
+        // 确保块大小在合理范围内
+        chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
     }
 
     /// 下载所有块
@@ -396,7 +418,7 @@ impl DownloadTask {
         let mut handles = Vec::new();
 
         let chunks = {
-            let stats = self.stats.lock();
+            let stats = self.stats.lock().await;
             stats.chunks.clone()
         };
 
@@ -432,7 +454,7 @@ impl DownloadTask {
             }
             // 重新获取块信息并重新创建任务
             let chunks = {
-                let stats = self.stats.lock();
+                let stats = self.stats.lock().await;
                 stats.chunks.clone()
             };
 
@@ -502,6 +524,7 @@ impl DownloadTask {
         let output_path = self
             .output_path
             .lock()
+            .await
             .as_ref()
             .ok_or_else(|| DownloadError::Other("Output path not set".to_string()))?
             .clone();
@@ -548,7 +571,7 @@ impl DownloadTask {
             chunk.downloaded += chunk_data.len() as u64;
 
             // 更新统计信息
-            let mut stats = self.stats.lock();
+            let mut stats = self.stats.lock().await;
             stats.downloaded += chunk_data.len() as u64;
 
             // 计算速度
@@ -577,7 +600,14 @@ impl DownloadTask {
             // 定期保存状态（每下载1MB保存一次）
             // 注意：在持有 stats 锁时不能调用 save_state，否则会导致死锁
             // 所以这里先释放锁再保存状态
-            let should_save = chunk.downloaded % (1024 * 1024) < chunk_data.len() as u64;
+            const SAVE_INTERVAL: u64 = 1024 * 1024; // 1MB
+            let total_downloaded_before = stats.downloaded - chunk_data.len() as u64;
+            let total_downloaded_after = stats.downloaded;
+
+            // 检查是否跨越了1MB的边界
+            let should_save = (total_downloaded_before / SAVE_INTERVAL)
+                != (total_downloaded_after / SAVE_INTERVAL);
+
             if should_save && !self.is_paused.load(Ordering::Relaxed) {
                 // 保存当前统计信息并释放锁
                 let current_downloaded = stats.downloaded;
@@ -587,18 +617,19 @@ impl DownloadTask {
                 let current_chunks = stats.chunks.clone();
                 drop(stats); // 释放锁
 
-                if let Err(e) = self.save_state() {
-                    error!("保存状态文件失败: {}", e);
-                }
+                let _ = self
+                    .save_state()
+                    .await
+                    .inspect_err(|e| error!("保存状态文件失败: {}", e));
 
                 // 重新获取锁以继续更新统计信息
-                stats = self.stats.lock();
+                let mut new_stats = self.stats.lock().await;
                 // 恢复统计信息（防止其他线程修改）
-                stats.downloaded = current_downloaded;
-                stats.speed = current_speed;
-                stats.elapsed = current_elapsed;
-                stats.remaining = current_remaining;
-                stats.chunks = current_chunks;
+                new_stats.downloaded = current_downloaded;
+                new_stats.speed = current_speed;
+                new_stats.elapsed = current_elapsed;
+                new_stats.remaining = current_remaining;
+                new_stats.chunks = current_chunks;
             }
         }
 
@@ -606,43 +637,43 @@ impl DownloadTask {
     }
 
     /// 暂停下载
-    pub fn pause(&self) {
-        *self.status.lock() = DownloadStatus::Paused;
+    pub async fn pause(&self) {
+        *self.status.lock().await = DownloadStatus::Paused;
         self.is_paused.store(true, Ordering::Relaxed);
         self.pause_notify.notify_waiters(); // 通知所有等待的任务
 
         // 保存暂停状态（只有在文件名已设置时才保存）
-        if self.output_path.lock().is_some()
-            && let Err(e) = self.save_state()
+        if self.output_path.lock().await.is_some()
+            && let Err(e) = self.save_state().await
         {
             error!("保存暂停状态失败: {}", e);
         }
     }
 
     /// 恢复下载
-    pub fn resume(&self) {
+    pub async fn resume(&self) {
         self.is_paused.store(false, Ordering::Relaxed);
         self.pause_notify.notify_waiters(); // 通知所有等待的任务
-        *self.status.lock() = DownloadStatus::Downloading;
+        *self.status.lock().await = DownloadStatus::Downloading;
     }
 
     /// 取消下载
-    pub fn cancel(&self) {
-        *self.status.lock() = DownloadStatus::Failed("Cancelled".to_string());
+    pub async fn cancel(&self) {
+        *self.status.lock().await = DownloadStatus::Failed("Cancelled".to_string());
         self.is_cancelled.store(true, Ordering::Relaxed);
 
         // 删除状态文件
-        let _ = fs::remove_file(self.get_current_state_file_path());
+        let _ = tokio::fs::remove_file(self.get_current_state_file_path().await).await;
     }
 
     /// 获取下载状态
-    pub fn get_status(&self) -> DownloadStatus {
-        self.status.lock().clone()
+    pub async fn get_status(&self) -> DownloadStatus {
+        self.status.lock().await.clone()
     }
 
     /// 获取下载统计
-    pub fn get_stats(&self) -> DownloadStats {
-        self.stats.lock().clone()
+    pub async fn get_stats(&self) -> DownloadStats {
+        self.stats.lock().await.clone()
     }
 
     /// 更新配置
@@ -659,20 +690,21 @@ impl DownloadTask {
     }
 
     /// 获取当前状态文件路径
-    fn get_current_state_file_path(&self) -> PathBuf {
-        self.state_file_path.lock().clone()
+    async fn get_current_state_file_path(&self) -> PathBuf {
+        self.state_file_path.lock().await.clone()
     }
 
     /// 保存下载状态到文件
-    fn save_state(&self) -> Result<(), DownloadError> {
+    async fn save_state(&self) -> Result<(), DownloadError> {
         // 获取统计信息时只获取一次锁，避免死锁
-        let stats = self.stats.lock();
+        let stats = self.stats.lock().await;
         let total_size = stats.total_size;
         let chunks = stats.chunks.clone();
 
         let output_path = self
             .output_path
             .lock()
+            .await
             .as_ref()
             .ok_or_else(|| DownloadError::Other("Output path not set".to_string()))?
             .clone();
@@ -686,24 +718,26 @@ impl DownloadTask {
         };
 
         let state_json = serde_json::to_string(&state)?;
-        fs::write(self.get_current_state_file_path(), state_json)?;
+        tokio::fs::write(self.get_current_state_file_path().await, state_json).await?;
         Ok(())
     }
 
     /// 从文件加载下载状态
-    fn load_state(&self) -> Result<DownloadState, DownloadError> {
-        let state_file_path = self.get_current_state_file_path();
-        if !state_file_path.exists() {
+    async fn load_state(&self) -> Result<DownloadState, DownloadError> {
+        let state_file_path = self.get_current_state_file_path().await;
+        info!("加载状态文件：{:?}", state_file_path);
+        if tokio::fs::metadata(&state_file_path).await.is_err() {
             return Err(DownloadError::InvalidStateFile);
         }
 
-        let state_json = fs::read_to_string(&state_file_path)?;
+        let state_json = tokio::fs::read_to_string(&state_file_path).await?;
         let state: DownloadState = serde_json::from_str(&state_json)?;
 
         // 验证状态文件的有效性
         let current_output_path = self
             .output_path
             .lock()
+            .await
             .as_ref()
             .ok_or_else(|| DownloadError::InvalidStateFile)?
             .clone();
@@ -726,7 +760,6 @@ impl DownloadTask {
             is_cancelled: self.is_cancelled.clone(),
             is_paused: self.is_paused.clone(),
             pause_notify: self.pause_notify.clone(),
-            state_sender: self.state_sender.clone(),
             state_file_path: self.state_file_path.clone(),
             supports_range: self.supports_range.clone(),
         })
@@ -749,17 +782,22 @@ impl DownloadManager {
     }
 
     /// 添加下载任务
-    pub fn add_task(&self, url: String, download_dir: PathBuf, config: DownloadConfig) -> String {
+    pub async fn add_task(
+        &self,
+        url: String,
+        download_dir: PathBuf,
+        config: DownloadConfig,
+    ) -> String {
         let task_id = uuid::Uuid::new_v4().to_string();
         let task = Arc::new(DownloadTask::new(url, download_dir, config));
 
-        self.tasks.lock().insert(task_id.clone(), task);
+        self.tasks.lock().await.insert(task_id.clone(), task);
         task_id
     }
 
     /// 开始下载任务
     pub async fn start_task(&self, task_id: &str) -> Result<(), DownloadError> {
-        let task = self.tasks.lock().get(task_id).cloned();
+        let task = self.tasks.lock().await.get(task_id).cloned();
         if let Some(task) = task {
             task.start().await?;
             Ok(())
@@ -769,33 +807,41 @@ impl DownloadManager {
     }
 
     /// 获取任务状态
-    pub fn get_task_status(&self, task_id: &str) -> Option<DownloadStatus> {
-        self.tasks.lock().get(task_id).map(|task| task.get_status())
+    pub async fn get_task_status(&self, task_id: &str) -> Option<DownloadStatus> {
+        if let Some(task) = self.tasks.lock().await.get(task_id) {
+            Some(task.get_status().await)
+        } else {
+            None
+        }
     }
 
     /// 获取任务统计
-    pub fn get_task_stats(&self, task_id: &str) -> Option<DownloadStats> {
-        self.tasks.lock().get(task_id).map(|task| task.get_stats())
+    pub async fn get_task_stats(&self, task_id: &str) -> Option<DownloadStats> {
+        if let Some(task) = self.tasks.lock().await.get(task_id) {
+            Some(task.get_stats().await)
+        } else {
+            None
+        }
     }
 
     /// 暂停任务
-    pub fn pause_task(&self, task_id: &str) {
-        if let Some(task) = self.tasks.lock().get(task_id) {
-            task.pause();
+    pub async fn pause_task(&self, task_id: &str) {
+        if let Some(task) = self.tasks.lock().await.get(task_id) {
+            task.pause().await;
         }
     }
 
     /// 恢复任务
-    pub fn resume_task(&self, task_id: &str) {
-        if let Some(task) = self.tasks.lock().get(task_id) {
-            task.resume();
+    pub async fn resume_task(&self, task_id: &str) {
+        if let Some(task) = self.tasks.lock().await.get(task_id) {
+            task.resume().await;
         }
     }
 
     /// 取消任务
-    pub fn cancel_task(&self, task_id: &str) {
-        if let Some(task) = self.tasks.lock().get(task_id) {
-            task.cancel();
+    pub async fn cancel_task(&self, task_id: &str) {
+        if let Some(task) = self.tasks.lock().await.get(task_id) {
+            task.cancel().await;
         }
     }
 }
@@ -821,7 +867,7 @@ mod tests {
 
         assert_eq!(task.url, "https://example.com/file.txt");
         assert_eq!(task.download_dir, PathBuf::from("."));
-        assert!(task.output_path.lock().is_none());
+        assert!(task.output_path.lock().await.is_none());
     }
 
     #[tokio::test]
@@ -829,16 +875,70 @@ mod tests {
         let manager = DownloadManager::new();
         let temp_dir = tempdir().unwrap();
 
-        let task_id = manager.add_task(
-            "https://httpbin.org/bytes/1024".to_string(),
-            temp_dir.path().to_path_buf(),
+        let task_id = manager
+            .add_task(
+                "https://example.com/file.txt".to_string(),
+                temp_dir.path().to_path_buf(),
+                DownloadConfig {
+                    max_connections: 1,
+                    chunk_size: 512,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(!task_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_calculate_chunk_size() {
+        let task = DownloadTask::new(
+            "https://example.com/file.txt".to_string(),
+            PathBuf::from("."),
+            DownloadConfig::default(),
+        );
+
+        // 测试小文件：1MB - 应该使用100KB块大小
+        let chunk_size = task.calculate_chunk_size(1 * 1024 * 1024);
+        println!(
+            "1MB文件块大小: {} bytes (期望: {} bytes)",
+            chunk_size,
+            100 * 1024
+        );
+        assert_eq!(chunk_size, 100 * 1024);
+
+        // 测试中等文件：10MB - 应该使用500KB块大小
+        let chunk_size = task.calculate_chunk_size(10 * 1024 * 1024);
+        println!(
+            "10MB文件块大小: {} bytes (期望: {} bytes)",
+            chunk_size,
+            500 * 1024
+        );
+        assert_eq!(chunk_size, 500 * 1024);
+
+        // 测试大文件：1GB - 应该使用1MB块大小
+        let chunk_size = task.calculate_chunk_size(1024 * 1024 * 1024);
+        println!(
+            "1GB文件块大小: {} bytes (期望: {} bytes)",
+            chunk_size,
+            1 * 1024 * 1024
+        );
+        assert_eq!(chunk_size, 1 * 1024 * 1024);
+
+        // 测试自定义块大小配置 - 应该使用配置的块大小
+        let task_with_custom_chunk = DownloadTask::new(
+            "https://example.com/file.txt".to_string(),
+            PathBuf::from("."),
             DownloadConfig {
-                max_connections: 1,
-                chunk_size: 512,
+                chunk_size: 2 * 1024 * 1024,
                 ..Default::default()
             },
         );
+        let chunk_size = task_with_custom_chunk.calculate_chunk_size(100 * 1024 * 1024);
+        assert_eq!(chunk_size, 2 * 1024 * 1024);
 
-        assert!(!task_id.is_empty());
+        // 测试边界情况：0字节文件
+        let chunk_size = task.calculate_chunk_size(0);
+        assert_eq!(chunk_size, 100 * 1024); // 应该使用最小块大小
     }
 }
