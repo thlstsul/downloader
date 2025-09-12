@@ -23,7 +23,7 @@ fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str
     {
         let parsed = content_disposition::parse_content_disposition(disposition_str);
         if let Some(filename) = parsed.filename() {
-            return filename.0;
+            return format!("{}.{}", filename.0, filename.1.unwrap_or_default());
         }
     }
 
@@ -31,7 +31,6 @@ fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str
     extract_filename_from_url(url)
 }
 
-/// 从URL中提取文件名
 fn extract_filename_from_url(url: &str) -> String {
     // 尝试从URL路径中提取文件名
     if let Ok(parsed_url) = url::Url::parse(url) {
