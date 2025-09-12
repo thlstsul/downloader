@@ -20,7 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 配置下载参数 - 使用较低的速度限制以便有时间暂停
     let config = DownloadConfig {
         max_connections: 4,
-        chunk_size: 512 * 1024, // 512KB
+        chunk_size: 0, // 512KB
         speed_limit: None,
         auto_resume: true, // 启用断点续传
         ..Default::default()
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi
     let task_id = manager
         .add_task(
-            "https://download-installer.cdn.mozilla.net/pub/firefox/releases/139.0.4/win64/zh-CN/Firefox%20Setup%20139.0.4.msi".to_string(), // 100KB 测试文件
+            "https://download.microsoft.com/download/6/8/3/683178b7-baac-4b0d-95be-065a945aadee/Windows11InstallationAssistant.exe".to_string(), // 100KB 测试文件
             download_dir.clone(),
             config,
         )
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 检查状态文件是否已删除
-    let output_path = download_dir.join("Firefox Setup 139.0.4.msi");
+    let output_path = download_dir.join("Windows11InstallationAssistant.exe");
     let state_file_path = output_path.with_extension("download_state");
     if fs::metadata(&state_file_path).await.is_err() {
         log::info!("状态文件已自动删除");
@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 清理下载的文件（如果存在）
     if fs::metadata(&output_path).await.is_ok() {
-        // let _ = fs::remove_file(output_path).await;
-        // log::info!("下载文件已自动删除");
+        let _ = fs::remove_file(output_path).await;
+        log::info!("下载文件已自动删除");
     }
 
     Ok(())

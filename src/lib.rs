@@ -15,42 +15,6 @@ use tokio::sync::Mutex;
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::sleep;
 
-/// 从HTTP响应头中提取文件名
-fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str) -> String {
-    // 首先尝试从 Content-Disposition 头中提取文件名
-    if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION)
-        && let Ok(disposition_str) = content_disposition.to_str()
-    {
-        let parsed = content_disposition::parse_content_disposition(disposition_str);
-        if let Some(filename) = parsed.filename() {
-            return format!("{}.{}", filename.0, filename.1.unwrap_or_default());
-        }
-    }
-
-    // 如果Content-Disposition中没有文件名，从URL路径中提取
-    extract_filename_from_url(url)
-}
-
-fn extract_filename_from_url(url: &str) -> String {
-    // 尝试从URL路径中提取文件名
-    if let Ok(parsed_url) = url::Url::parse(url) {
-        let path = parsed_url.path();
-        if let Some(filename) = path.split('/').next_back()
-            && !filename.is_empty()
-            && filename != "/"
-        {
-            // 解码URL编码的文件名
-            if let Ok(decoded) = urlencoding::decode(filename) {
-                return decoded.to_string();
-            }
-            return filename.to_string();
-        }
-    }
-
-    // 如果无法从URL提取，使用默认文件名
-    "downloaded_file".to_string()
-}
-
 /// 下载器错误类型
 #[derive(Error, Debug)]
 pub enum DownloadError {
@@ -223,7 +187,7 @@ impl DownloadTask {
             }
 
             // 从响应头中提取文件名并设置输出路径
-            task.setup_output_path(&response.headers(), &task.url).await;
+            task.setup_output_path(response.headers(), &task.url).await;
 
             // 尝试从状态文件恢复
             let mut is_resume = false;
@@ -388,7 +352,7 @@ impl DownloadTask {
         // 最大块大小：10MB
         const MAX_CHUNK_SIZE: u64 = 10 * 1024 * 1024;
         // 目标块大小：1MB
-        const TARGET_CHUNK_SIZE: u64 = 1 * 1024 * 1024;
+        const TARGET_CHUNK_SIZE: u64 = 1024 * 1024;
 
         // 如果配置中指定了块大小，优先使用配置的值
         if self.config.chunk_size > 0 {
@@ -426,10 +390,14 @@ impl DownloadTask {
                 return Err(DownloadError::Cancelled);
             }
 
-            // 检查是否暂停 - 只在创建任务时检查，不阻塞其他块的创建
+            // 检查是否暂停 - 在获取锁之前检查，避免死锁
             if self.is_paused.load(Ordering::Relaxed) {
-                // 如果暂停，跳过这个块的创建，让已经创建的块处理暂停
-                continue;
+                // 等待恢复通知
+                self.pause_notify.notified().await;
+
+                if self.is_cancelled.load(Ordering::Relaxed) {
+                    return Err(DownloadError::Cancelled);
+                }
             }
 
             let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -445,48 +413,12 @@ impl DownloadTask {
             handles.push(handle);
         }
 
-        // 如果没有创建任何任务（全部被暂停），等待恢复
-        if handles.is_empty() && self.is_paused.load(Ordering::Relaxed) {
-            self.pause_notify.notified().await;
+        // 等待所有下载任务完成
+        for handle in handles {
             if self.is_cancelled.load(Ordering::Relaxed) {
                 return Err(DownloadError::Cancelled);
             }
-            // 重新获取块信息并重新创建任务
-            let chunks = {
-                let stats = self.stats.lock().await;
-                stats.chunks.clone()
-            };
-
-            for chunk in chunks {
-                if self.is_cancelled.load(Ordering::Relaxed) {
-                    return Err(DownloadError::Cancelled);
-                }
-
-                if self.is_paused.load(Ordering::Relaxed) {
-                    continue;
-                }
-
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
-                let client = client.clone();
-                let task = self.clone_arc();
-
-                let handle = tokio::spawn(async move {
-                    let result = task.download_chunk(&client, chunk).await;
-                    drop(permit);
-                    result
-                });
-
-                handles.push(handle);
-            }
-        }
-
-        // 等待所有下载任务完成
-        for handle in handles {
             handle.await??;
-        }
-
-        if self.is_cancelled.load(Ordering::Relaxed) {
-            return Err(DownloadError::Cancelled);
         }
 
         Ok(())
@@ -540,17 +472,6 @@ impl DownloadTask {
         while let Some(chunk_data) = response.chunk().await? {
             if self.is_cancelled.load(Ordering::Relaxed) {
                 return Err(DownloadError::Cancelled);
-            }
-
-            // 检查是否暂停 - 在获取锁之前检查，避免死锁
-            if self.is_paused.load(Ordering::Relaxed) {
-                // 等待恢复通知
-                self.pause_notify.notified().await;
-
-                if self.is_cancelled.load(Ordering::Relaxed) {
-                    return Err(DownloadError::Cancelled);
-                }
-                continue;
             }
 
             // 应用速度限制
@@ -607,7 +528,7 @@ impl DownloadTask {
             let should_save = (total_downloaded_before / SAVE_INTERVAL)
                 != (total_downloaded_after / SAVE_INTERVAL);
 
-            if should_save && !self.is_paused.load(Ordering::Relaxed) {
+            if should_save {
                 // 保存当前统计信息并释放锁
                 let current_downloaded = stats.downloaded;
                 let current_speed = stats.speed;
@@ -629,6 +550,16 @@ impl DownloadTask {
                 new_stats.elapsed = current_elapsed;
                 new_stats.remaining = current_remaining;
                 new_stats.chunks = current_chunks;
+            }
+
+            // 检查是否暂停 - 在获取锁之前检查，避免死锁
+            if self.is_paused.load(Ordering::Relaxed) {
+                // 等待恢复通知
+                self.pause_notify.notified().await;
+
+                if self.is_cancelled.load(Ordering::Relaxed) {
+                    return Err(DownloadError::Cancelled);
+                }
             }
         }
 
@@ -849,6 +780,42 @@ impl Default for DownloadManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 从HTTP响应头中提取文件名
+fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str) -> String {
+    // 首先尝试从 Content-Disposition 头中提取文件名
+    if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION)
+        && let Ok(disposition_str) = content_disposition.to_str()
+    {
+        let parsed = content_disposition::parse_content_disposition(disposition_str);
+        if let Some(filename) = parsed.filename() {
+            return format!("{}.{}", filename.0, filename.1.unwrap_or_default());
+        }
+    }
+
+    // 如果Content-Disposition中没有文件名，从URL路径中提取
+    extract_filename_from_url(url)
+}
+
+fn extract_filename_from_url(url: &str) -> String {
+    // 尝试从URL路径中提取文件名
+    if let Ok(parsed_url) = url::Url::parse(url) {
+        let path = parsed_url.path();
+        if let Some(filename) = path.split('/').next_back()
+            && !filename.is_empty()
+            && filename != "/"
+        {
+            // 解码URL编码的文件名
+            if let Ok(decoded) = urlencoding::decode(filename) {
+                return decoded.to_string();
+            }
+            return filename.to_string();
+        }
+    }
+
+    // 如果无法从URL提取，使用默认文件名
+    "downloaded_file".to_string()
 }
 
 #[cfg(test)]

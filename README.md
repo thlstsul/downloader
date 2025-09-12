@@ -32,7 +32,7 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = DownloadManager::new();
-    
+
     let config = DownloadConfig {
         max_connections: 4,
         chunk_size: 1 * 1024 * 1024,
@@ -40,15 +40,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auto_resume: true,
         ..Default::default()
     };
-    
+
     let task_id = manager.add_task(
         "https://example.com/large-file.zip".to_string(),
         PathBuf::from("downloaded_file.zip"),
         config,
     );
-    
+
     manager.start_task(&task_id).await?;
-    
+
     Ok(())
 }
 ```
@@ -65,23 +65,23 @@ use tokio::time::sleep;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = DownloadManager::new();
     let task_id = manager.add_task(/* ... */);
-    
+
     manager.start_task(&task_id).await?;
-    
+
     loop {
         sleep(Duration::from_secs(1)).await;
-        
+
         if let Some(stats) = manager.get_task_stats(&task_id) {
             let progress = (stats.downloaded as f64 / stats.total_size as f64) * 100.0;
             println!("进度: {:.1}% | 速度: {:.1} KB/s", progress, stats.speed / 1024.0);
-            
+
             if stats.downloaded >= stats.total_size {
                 println!("下载完成!");
                 break;
             }
         }
     }
-    
+
     Ok(())
 }
 ```
@@ -99,6 +99,7 @@ pub struct DownloadConfig {
     pub speed_limit: Option<u64>,  // 速度限制（字节/秒）
     pub auto_resume: bool,         // 是否自动断点续传
     pub temp_dir: Option<PathBuf>, // 临时文件目录
+    pub cookies: Option<String>,   // Cookies
 }
 ```
 
@@ -179,7 +180,7 @@ pub enum DownloadError {
 ## 性能优化建议
 
 1. **连接数调整**: 根据网络状况动态调整 `max_connections`
-2. **块大小优化**: 大文件使用较大的块大小（2-4MB），小文件使用较小的块大小
+2. **块大小优化**: 大文件使用较大的块大小（2-4MB），小文件使用较小的块大小；为 0 时，自动调节
 3. **速度限制**: 在带宽受限的环境中使用速度限制避免网络拥塞
 4. **断点续传**: 启用 `auto_resume` 避免重复下载
 
