@@ -264,7 +264,9 @@ impl DownloadTask {
             cookie_header.insert(COOKIE, cookies);
             client_builder = client_builder.default_headers(cookie_header);
         }
+        let user_agent = std::env::var("USER_AGENT").unwrap_or_default();
         client_builder
+            .user_agent(user_agent)
             .build()
             .map_err(|e| DownloadError::Other(format!("Failed to build client: {}", e)))
     }
@@ -699,7 +701,6 @@ impl DownloadTask {
 /// 下载管理器
 pub struct DownloadManager {
     tasks: Arc<Mutex<HashMap<String, Arc<DownloadTask>>>>,
-    _client: Client,
 }
 
 impl DownloadManager {
@@ -707,7 +708,6 @@ impl DownloadManager {
     pub fn new() -> Self {
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
-            _client: Client::new(),
         }
     }
 
