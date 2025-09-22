@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 检查状态文件是否已删除
-    let output_path = download_dir.join("Windows11InstallationAssistant.exe");
+    let output_path = download_dir.join(task_id);
     let state_file_path = output_path.with_extension("download_state");
     if fs::metadata(&state_file_path).await.is_err() {
         log::info!("状态文件已自动删除");
