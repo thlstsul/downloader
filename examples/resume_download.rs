@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 等待一段时间让下载开始
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(20)).await;
 
     // 暂停下载
     log::info!("暂停下载...");
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 检查状态文件是否已删除
-    let output_path = download_dir.join(task_id);
+    let output_path = download_dir.join("Windows11InstallationAssistant.exe");
     let state_file_path = output_path.with_extension("download_state");
     if fs::metadata(&state_file_path).await.is_err() {
         log::info!("状态文件已自动删除");
@@ -148,8 +148,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 清理下载的文件（如果存在）
     if fs::metadata(&output_path).await.is_ok() {
-        let _ = fs::remove_file(output_path).await;
-        log::info!("下载文件已自动删除");
+        // let _ = fs::remove_file(output_path).await;
+        // log::info!("下载文件已自动删除");
     }
 
     Ok(())

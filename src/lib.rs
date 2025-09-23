@@ -224,7 +224,6 @@ impl DownloadTask {
 
             // 下载完成后删除状态文件
             if result.is_ok() {
-                let _ = tokio::fs::remove_file(task.get_state_file_path()).await;
                 *task.status.lock().await = DownloadStatus::Completed;
             } else {
                 *task.status.lock().await = DownloadStatus::Failed("Download failed".to_string());
@@ -239,7 +238,7 @@ impl DownloadTask {
         let filename = extract_filename_from_headers(headers, url);
 
         let mut filename_guard = self.filename.lock().await;
-        *filename_guard = Some(filename);
+        *filename_guard = filename;
     }
 
     /// 构建带有配置的 HTTP 客户端
@@ -399,12 +398,11 @@ impl DownloadTask {
             handle.await??;
         }
 
-        if let Some(filename) = self.filename.lock().await.as_ref() {
-            // 改为最终文件名
-            let from = self.download_dir.join(self.id.to_string());
-            let to = self.download_dir.join(filename);
-            tokio::fs::rename(from, to).await?;
-        }
+        // 改为最终文件名
+        let from = self.get_output_path().await;
+        let to = self.download_dir.join(self.get_filename().await);
+        tokio::fs::rename(from, to).await?;
+        let _ = tokio::fs::remove_file(self.get_state_file_path().await).await;
 
         Ok(())
     }
@@ -437,7 +435,7 @@ impl DownloadTask {
 
         let mut response = request.send().await?;
 
-        let output_path = self.get_output_path();
+        let output_path = self.get_output_path().await;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -570,7 +568,7 @@ impl DownloadTask {
         self.is_cancelled.store(true, Ordering::Relaxed);
 
         // 删除状态文件
-        let _ = tokio::fs::remove_file(self.get_state_file_path()).await;
+        let _ = tokio::fs::remove_file(self.get_state_file_path().await).await;
     }
 
     /// 获取下载状态
@@ -590,16 +588,33 @@ impl DownloadTask {
     }
 
     /// 获取当前状态文件路径
-    fn get_state_file_path(&self) -> PathBuf {
-        self.get_output_path().with_extension("download_state")
+    async fn get_state_file_path(&self) -> PathBuf {
+        self.get_output_path()
+            .await
+            .with_extension("download_state")
     }
 
-    fn get_output_path(&self) -> PathBuf {
-        self.download_dir.join(self.id.to_string())
+    /// 获取当前输出路径（临时）
+    async fn get_output_path(&self) -> PathBuf {
+        self.download_dir
+            .join(self.get_filename().await)
+            .with_extension("temp")
+    }
+
+    async fn get_filename(&self) -> String {
+        self.filename
+            .lock()
+            .await
+            .clone()
+            .unwrap_or(self.id.to_string())
     }
 
     /// 保存下载状态到文件
     async fn save_state(&self) -> Result<(), DownloadError> {
+        if self.filename.lock().await.is_none() {
+            return Ok(());
+        }
+
         // 获取统计信息时只获取一次锁，避免死锁
         let stats = self.stats.lock().await;
         let total_size = stats.total_size;
@@ -613,13 +628,13 @@ impl DownloadTask {
         };
 
         let state_json = serde_json::to_string(&state)?;
-        tokio::fs::write(self.get_state_file_path(), state_json).await?;
+        tokio::fs::write(self.get_state_file_path().await, state_json).await?;
         Ok(())
     }
 
     /// 从文件加载下载状态
     async fn load_state(&self) -> Result<DownloadState, DownloadError> {
-        let state_file_path = self.get_state_file_path();
+        let state_file_path = self.get_state_file_path().await;
         info!("加载状态文件：{:?}", state_file_path);
         if tokio::fs::metadata(&state_file_path).await.is_err() {
             return Err(DownloadError::InvalidStateFile);
@@ -739,39 +754,37 @@ impl Default for DownloadManager {
 }
 
 /// 从HTTP响应头中提取文件名
-fn extract_filename_from_headers(headers: &reqwest::header::HeaderMap, url: &str) -> String {
+fn extract_filename_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    url: &str,
+) -> Option<String> {
     // 首先尝试从 Content-Disposition 头中提取文件名
     if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION)
         && let Ok(disposition_str) = content_disposition.to_str()
+        && let Some(filename) =
+            content_disposition::parse_content_disposition(disposition_str).filename()
     {
-        let parsed = content_disposition::parse_content_disposition(disposition_str);
-        if let Some(filename) = parsed.filename() {
-            return format!("{}.{}", filename.0, filename.1.unwrap_or_default());
-        }
+        return Some(format!("{}.{}", filename.0, filename.1.unwrap_or_default()));
     }
 
     // 如果Content-Disposition中没有文件名，从URL路径中提取
     extract_filename_from_url(url)
 }
 
-fn extract_filename_from_url(url: &str) -> String {
+fn extract_filename_from_url(url: &str) -> Option<String> {
     // 尝试从URL路径中提取文件名
-    if let Ok(parsed_url) = url::Url::parse(url) {
-        let path = parsed_url.path();
-        if let Some(filename) = path.split('/').next_back()
-            && !filename.is_empty()
-            && filename != "/"
-        {
-            // 解码URL编码的文件名
-            if let Ok(decoded) = urlencoding::decode(filename) {
-                return decoded.to_string();
-            }
-            return filename.to_string();
-        }
+    let parsed_url = url::Url::parse(url).ok()?;
+    let path = parsed_url.path();
+    let filename = path.split('/').next_back()?;
+    if filename.is_empty() || filename == "/" {
+        return None;
     }
 
-    // 如果无法从URL提取，使用默认文件名
-    "downloaded_file".to_string()
+    // 解码URL编码的文件名
+    if let Ok(decoded) = urlencoding::decode(filename) {
+        return Some(decoded.to_string());
+    }
+    return Some(filename.to_string());
 }
 
 #[cfg(test)]
@@ -789,7 +802,6 @@ mod tests {
 
         assert_eq!(task.url, "https://example.com/file.txt");
         assert_eq!(task.download_dir, PathBuf::from("."));
-        assert!(task.filename.lock().await.is_none());
     }
 
     #[tokio::test]
