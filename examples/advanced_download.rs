@@ -17,11 +17,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manager = DownloadManager::new();
 
     // 初始配置
-    let mut config = DownloadConfig {
+    let config = DownloadConfig {
         max_connections: 2,
         chunk_size: 512 * 1024,        // 512KB
         speed_limit: Some(512 * 1024), // 限制为 512KB/s
         auto_resume: true,
+        // 启用读取超时：服务器中途断流但保持连接时，库会把挂起转成终态 Failed，
+        // 监控循环得以退出；否则 response.chunk() 会永久阻塞、示例无限等待
+        read_timeout: Some(Duration::from_secs(30)),
         ..Default::default()
     };
 
@@ -70,48 +73,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 stats.total_size
             );
 
-            // 动态调整配置
-            if last_update.elapsed() > Duration::from_secs(5) {
+            // 动态调整配置：每 5 秒推进一个阶段。演示 get_task_config 与
+            // update_task_config 配对——读取当前配置 → 局部修改 speed_limit →
+            // 写回（speed_limit 立即生效），而非在示例里手动维护一份可能漂移的副本。
+            if last_update.elapsed() > Duration::from_secs(5) && phase < 4 {
                 phase += 1;
                 last_update = std::time::Instant::now();
 
-                match phase {
+                let new_limit = match phase {
                     1 => {
-                        // 阶段1: 增加连接数
-                        config.max_connections = 4;
-                        config.speed_limit = None; // 取消速度限制
-                        log::info!("动态调整: 增加到 4 连接，取消速度限制");
+                        log::info!("动态调整: 取消速度限制");
+                        None
                     }
                     2 => {
-                        // 阶段2: 进一步增加连接数
-                        config.max_connections = 8;
-                        log::info!("动态调整: 增加到 8 连接");
+                        log::info!("动态调整: 启用 512KB/s 限速");
+                        Some(512 * 1024)
                     }
                     3 => {
-                        // 阶段3: 重新启用速度限制
-                        config.max_connections = 4;
-                        config.speed_limit = Some(1024 * 1024); // 1MB/s
-                        log::info!("动态调整: 减少到 4 连接，启用 1MB/s 限速");
+                        log::info!("动态调整: 提高到 2MB/s 限速");
+                        Some(2 * 1024 * 1024)
                     }
                     4 => {
-                        // 阶段4: 减小块大小
-                        config.chunk_size = 256 * 1024; // 256KB
-                        log::info!("动态调整: 块大小减小到 256KB");
+                        log::info!("动态调整: 恢复 1MB/s 限速");
+                        Some(1024 * 1024)
                     }
-                    _ => {
-                        // 保持当前配置
+                    _ => unreachable!("phase 由 `phase < 4` 守卫约束在 1..=4"),
+                };
+
+                if let Some(mut current) = manager.get_task_config(&task_id).await {
+                    current.speed_limit = new_limit;
+                    if let Err(e) = manager.update_task_config(&task_id, current).await {
+                        log::error!("更新配置失败: {}", e);
                     }
                 }
-
-                // 这里应该调用 task.update_config(config.clone())，但需要先实现这个方法
-                log::warn!("配置更新功能需要实现 task.update_config() 方法");
             }
 
-            // 检查是否完成
-            if stats.downloaded >= stats.total_size && stats.total_size > 0 {
-                log::info!("下载完成!");
-                break;
-            }
+            // 完成判定以任务终态为准（见下方 get_task_status 检查），不能仅凭
+            // 大小快照：进度显示 downloaded == total_size 时后台任务可能仍在收尾
+            // （临时文件 rename、状态写入），若此时 break 并 remove_task 会把正在
+            // 收尾的任务取消、删掉已完整下载的临时文件，导致最终文件丢失。
         }
 
         // 检查任务状态
@@ -143,7 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         log::info!("块信息:");
         for chunk in &stats.chunks {
-            let chunk_size = chunk.end - chunk.start + 1;
+            // 未知大小分块 end == u64::MAX，用饱和运算避免溢出
+            let chunk_size = chunk.end.saturating_sub(chunk.start).saturating_add(1);
             let chunk_progress = if chunk_size > 0 {
                 (chunk.downloaded as f64 / chunk_size as f64) * 100.0
             } else {
@@ -158,6 +159,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+
+    // 完成后移除任务，避免任务表无限增长（与 resume_download 示例保持一致）
+    manager.remove_task(&task_id).await;
+    log::info!("任务已移除");
 
     Ok(())
 }
