@@ -2,6 +2,14 @@
 name = "downloader"
 version = "0.2.0"
 edition = "2024"
+# edition 2024 的最低稳定 Rust 版本；代码使用的语言特性均不晚于该版本
+rust-version = "1.85"
+description = "基于 Tokio 与 reqwest 的异步下载器库：多连接并行下载、断点续传、速度限制、实时进度统计与动态配置调整"
+license = "MIT"
+repository = "https://gitee.com/thelostsoul/downloader"
+documentation = "https://docs.rs/downloader"
+keywords = ["download", "downloader", "http", "async", "resume"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 log = "0.4"
@@ -13,7 +21,7 @@ content_disposition = "0.4.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-tokio = { version = "1.0", features = ["fs", "rt", "time", "sync", "io-util"] }
+tokio = { version = "1.0", features = ["fs", "rt", "time", "sync", "io-util", "macros"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]

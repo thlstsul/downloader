@@ -44,6 +44,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 启用读取超时：服务器中途断流但保持连接时，库会把挂起转成终态 Failed，
         // 监控循环得以退出；否则 response.chunk() 会永久阻塞、调用方无限等待
         read_timeout: Some(Duration::from_secs(30)),
+        // 瞬时错误（请求/读取超时）自动重试次数：网络抖动或服务器瞬时过载时
+        // 重试很可能成功，重试间按指数退避（基数 retry_base_delay，翻倍封顶
+        // retry_max_delay）。分块重试从已下载偏移续传，不重复下载已完成部分。
+        // 0 表示禁用。
+        max_retries: 3,
+        // 指数退避基数与上限（默认 500ms / 10s）：第 1 次重试等待 retry_base_delay，
+        // 此后每次翻倍，超过 retry_max_delay 时封顶，避免重试风暴。
+        // 注意：暂停发生在退避窗口内时会立即生效并**冻结**退避计时——暂停时长
+        // 不计入退避，恢复后按剩余时间继续，不会因暂停而延迟或跳过重试。
+        retry_base_delay: Duration::from_millis(500),
+        retry_max_delay: Duration::from_secs(10),
         ..Default::default()
     };
 
@@ -147,6 +158,10 @@ pub struct DownloadConfig {
     pub cookies: Option<String>,   // Cookies（仅建连时读取）
     pub connect_timeout: Duration, // 连接超时（TCP 建连，默认 30 秒）
     pub read_timeout: Option<Duration>, // 读取超时（None 表示不启用；覆盖等待响应头与读取数据，用于检测下载挂起）
+    pub max_retries: u32, // 瞬时错误（请求/读取超时）自动重试次数（默认 3，0 表示禁用；分块重试从已下载偏移续传）
+    pub retry_base_delay: Duration, // 指数退避基数（默认 500ms；第 1 次重试前等待该时长，此后翻倍）
+    pub retry_max_delay: Duration, // 指数退避上限（默认 10s；翻倍超过该值时封顶）
+    // 提示：退避窗口内的 pause() 会立即生效并冻结退避计时，恢复后按剩余时间继续
 }
 ```
 
@@ -188,6 +203,9 @@ if let Some(current) = manager.get_task_config(&task_id).await {
     new_config.speed_limit = Some(2 * 1024 * 1024);
     manager.update_task_config(&task_id, new_config).await?;
 }
+
+// 列出当前所有任务 ID（按字典序排序，可配合 get_task_status 等遍历全部任务）
+let all_task_ids = manager.list_tasks().await;
 
 // 订阅进度（watch 接收端，实时收到最新统计快照）
 if let Some(mut progress) = manager.subscribe_progress(&task_id).await {
@@ -233,7 +251,7 @@ if let Ok(DownloadEvent::TaskCompleted { task_id }) = events.recv().await {
 }
 ```
 
-`DownloadEvent` 包含三种终止事件：`TaskCompleted`（完成）、`TaskFailed`（失败，携带原因字符串）、`TaskCancelled`（取消）。事件是「通知」而非权威状态——真实状态仍以 `get_task_status` 为准（订阅过慢或被广播丢弃时可能漏掉事件）。
+`DownloadEvent` 包含三种终止事件：`TaskCompleted`（完成）、`TaskFailed`（失败，携带结构化错误 `DownloadError`）、`TaskCancelled`（取消）。事件是「通知」而非权威状态——真实状态仍以 `get_task_status` 为准（订阅过慢或被广播丢弃时可能漏掉事件）。
 
 ### DownloadStats
 
@@ -266,20 +284,39 @@ cargo run --example advanced_download
 
 ## 错误处理
 
-库使用 `thiserror` 提供详细的错误类型：
+库使用 `thiserror` 提供详细的错误类型。`DownloadError` 实现 `Clone`/`PartialEq`/`Eq`，
+可直接存入 `DownloadStatus::Failed` 与 `DownloadEvent::TaskFailed`，供调用方程序化匹配
+具体错误变体，无需解析字符串：
 
 ```rust
 pub enum DownloadError {
-    TokioError(tokio::task::JoinError),
-    HttpError(reqwest::Error),
-    IoError(std::io::Error),
-    JsonError(serde_json::Error),
+    TokioError(Arc<tokio::task::JoinError>),
+    HttpError(Arc<reqwest::Error>),
+    IoError(Arc<std::io::Error>),
+    JsonError(Arc<serde_json::Error>),
     Cancelled,
     InvalidStateFile,
     TaskNotFound,   // 任务不存在（task_id 未注册或已移除）
     RequestTimeout, // 等待响应头超时（超过 read_timeout）
     ReadTimeout,    // 读取数据超时（下载中途连接挂起/断流）
     Other(String),
+}
+```
+
+内部错误（`reqwest::Error`、`JoinError` 等）不实现 `Clone`，故以 `Arc` 包装；
+`PartialEq`/`Eq` 先按变体判别（变体不同直接判不等），同变体再比较内部数据——
+`Other` 直接比较字符串，`Arc` 包装的内部错误退化为 Display 文本比较；
+`Serialize` 输出为字符串（反序列化还原为 `Other`），便于跨进程/持久化传递，
+同时保持 `DownloadStatus` 可序列化。
+
+可通过 `DownloadError::is_retryable()` 判断错误是否瞬时（`RequestTimeout`/`ReadTimeout`，
+重试可能成功），据此实现重试策略：
+
+```rust
+if let DownloadStatus::Failed(e) = manager.get_task_status(&id).await {
+    if e.is_retryable() {
+        manager.start_task(&id).await?; // 瞬时错误，尝试重试
+    }
 }
 ```
 

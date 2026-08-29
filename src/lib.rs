@@ -1,3 +1,62 @@
+//! # downloader —— Rust 异步下载器库
+//!
+//! 基于 Tokio 与 reqwest 的异步下载器，支持多连接并行下载、断点续传、速度限制、
+//! 实时进度统计与运行中动态调整配置。所有异步 API 均为 `async`，任务以 UUID 标识，
+//! 由 [`DownloadManager`] 统一管理。
+//!
+//! ## 核心类型
+//!
+//! - [`DownloadManager`]：任务管理器，负责添加/启动/暂停/恢复/取消/移除任务，
+//!   并提供全局事件总线（[`DownloadEvent`]）与任务枚举（[`DownloadManager::list_tasks`]）。
+//! - [`DownloadTask`]：单个下载任务的共享句柄，提供进度快照（[`DownloadTask::get_stats`]）、
+//!   实时进度订阅（[`DownloadTask::subscribe_progress`]）与 pause/resume/cancel 控制。
+//! - [`DownloadConfig`]：下载配置（连接数、块大小、速度限制、超时、自动重试等）。
+//! - [`DownloadStatus`] / [`DownloadError`]：结构化任务状态与错误，
+//!   可程序化匹配 `RequestTimeout`/`ReadTimeout` 等瞬时错误并自动重试。
+//!
+//! ## 快速开始
+//!
+//! ```no_run
+//! use std::path::PathBuf;
+//! use std::time::Duration;
+//!
+//! use downloader::{DownloadConfig, DownloadManager, DownloadStatus};
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let manager = DownloadManager::new();
+//!     let task_id = manager
+//!         .add_task(
+//!             "https://example.com/file.zip".to_string(),
+//!             PathBuf::from("."),
+//!             DownloadConfig::default(),
+//!         )
+//!         .await;
+//!     manager.start_task(&task_id).await.expect("开始下载失败");
+//!
+//!     // 轮询直至任务进入终态（也可用 subscribe_events / subscribe_progress 免轮询）
+//!     loop {
+//!         let status = manager.get_task_status(&task_id).await;
+//!         if matches!(
+//!             status,
+//!             Some(DownloadStatus::Completed)
+//!                 | Some(DownloadStatus::Failed(_))
+//!                 | Some(DownloadStatus::Cancelled)
+//!         ) {
+//!             break;
+//!         }
+//!         tokio::time::sleep(Duration::from_millis(100)).await;
+//!     }
+//! }
+//! ```
+//!
+//! 更完整的用法（进度订阅、事件监听、断点续传、速度限制等）见 `examples/` 目录
+//! 与 README。
+
+// 发布门禁：库的公开 API 必须全部有文档注释，新增公开项缺文档即编译失败，
+// 避免对外暴露无说明的接口（与 rustdoc 质量、`missing_docs` 规范一致）。
+#![deny(missing_docs)]
+
 use std::collections::{BTreeMap, HashMap};
 
 use std::path::PathBuf;
@@ -5,7 +64,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use log::{error, info};
+use log::{error, info, warn};
 use parking_lot::RwLock;
 use reqwest::Client;
 use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
@@ -18,18 +77,30 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 /// 下载器错误类型
-#[derive(Error, Debug)]
+///
+/// 实现 `Clone`/`PartialEq`/`Eq`，可直接存入 [`DownloadStatus::Failed`] 与
+/// [`DownloadEvent::TaskFailed`]，让调用方无需解析字符串即可程序化匹配
+/// `RequestTimeout`/`ReadTimeout`/`TaskNotFound` 等具体错误变体。
+/// 序列化采用 Display 字符串形式（反序列化还原为 [`DownloadError::Other`]），
+/// 便于跨进程/持久化传递，同时保持 `DownloadStatus` 可序列化。
+#[derive(Error, Debug, Clone)]
 pub enum DownloadError {
+    /// 内部 Tokio 任务错误（`JoinError`），如后台任务 panic 或被 join 时出错。
     #[error("Tokio任务错误: {0}")]
-    TokioError(#[from] tokio::task::JoinError),
+    TokioError(Arc<tokio::task::JoinError>),
+    /// 内部 HTTP 请求错误（`reqwest::Error`），如建连失败、DNS 解析失败、服务器返回异常。
     #[error("HTTP请求错误: {0}")]
-    HttpError(#[from] reqwest::Error),
+    HttpError(Arc<reqwest::Error>),
+    /// 内部 IO 错误（`std::io::Error`），如本地文件读写失败、磁盘空间不足。
     #[error("IO错误: {0}")]
-    IoError(#[from] std::io::Error),
+    IoError(Arc<std::io::Error>),
+    /// 内部 JSON 序列化错误（`serde_json::Error`），如状态文件解析失败。
     #[error("JSON序列化错误: {0}")]
-    JsonError(#[from] serde_json::Error),
+    JsonError(Arc<serde_json::Error>),
+    /// 下载被用户取消（调用 `cancel`/`cancel_task` 后产生）。
     #[error("下载被取消")]
     Cancelled,
+    /// 无效的下载状态文件：残留的 `.download_state` 内容损坏或格式不符合预期。
     #[error("无效的下载状态文件")]
     InvalidStateFile,
     /// 任务不存在：`task_id` 未在管理器中注册（多为调用方传入了错误/已移除的 ID）。
@@ -44,8 +115,103 @@ pub enum DownloadError {
     /// 同样属瞬时/可重试的错误。
     #[error("读取超时：连接可能在下载中途挂起")]
     ReadTimeout,
+    /// 其他错误（自定义文本）。多用于非结构化错误信息，或从状态文件反序列化还原而来。
     #[error("其他错误: {0}")]
     Other(String),
+}
+
+impl DownloadError {
+    /// 是否为瞬时/可重试错误（超时类）。
+    ///
+    /// 超时（请求/读取）通常由网络抖动或服务器过载引起，重试很可能成功；
+    /// 而 HTTP/IO/内容一致性错误多为永久性，盲目重试无意义。调用方可据此
+    /// 在下载失败后决定是否自动重试。
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            DownloadError::RequestTimeout | DownloadError::ReadTimeout
+        )
+    }
+}
+
+// 内部错误类型（`reqwest::Error`、`JoinError` 等）不实现 `Clone`/`PartialEq`/`Eq`，
+// 故以 `Arc` 包裹以支持存储与复制，并手动实现 `From` 转换（保持 `?`/`map_err` 兼容）。
+impl From<tokio::task::JoinError> for DownloadError {
+    fn from(e: tokio::task::JoinError) -> Self {
+        DownloadError::TokioError(Arc::new(e))
+    }
+}
+
+impl From<reqwest::Error> for DownloadError {
+    fn from(e: reqwest::Error) -> Self {
+        DownloadError::HttpError(Arc::new(e))
+    }
+}
+
+impl From<std::io::Error> for DownloadError {
+    fn from(e: std::io::Error) -> Self {
+        DownloadError::IoError(Arc::new(e))
+    }
+}
+
+impl From<serde_json::Error> for DownloadError {
+    fn from(e: serde_json::Error) -> Self {
+        DownloadError::JsonError(Arc::new(e))
+    }
+}
+
+// 内部错误类型（Arc 包裹的 JoinError/reqwest::Error 等）无法直接比较。旧实现
+// `self.to_string() == other.to_string()` 在每次比较时分配两个 Display 字符串，
+// 且 `Other` 变体也要绕道 Display 往返。新实现先按变体判别：变体不同直接判不等
+// （零分配，覆盖最常见的不等情形）；变体相同再比较内部数据——`Other` 直接比字符串，
+// Arc 包裹的内部错误才退化为展示文本比较。不同变体 Display 前缀不同，不会误判，
+// 与旧实现语义一致。
+impl PartialEq for DownloadError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (DownloadError::TokioError(a), DownloadError::TokioError(b)) => {
+                a.to_string() == b.to_string()
+            }
+            (DownloadError::HttpError(a), DownloadError::HttpError(b)) => {
+                a.to_string() == b.to_string()
+            }
+            (DownloadError::IoError(a), DownloadError::IoError(b)) => {
+                a.to_string() == b.to_string()
+            }
+            (DownloadError::JsonError(a), DownloadError::JsonError(b)) => {
+                a.to_string() == b.to_string()
+            }
+            (DownloadError::Cancelled, DownloadError::Cancelled)
+            | (DownloadError::InvalidStateFile, DownloadError::InvalidStateFile)
+            | (DownloadError::TaskNotFound, DownloadError::TaskNotFound)
+            | (DownloadError::RequestTimeout, DownloadError::RequestTimeout)
+            | (DownloadError::ReadTimeout, DownloadError::ReadTimeout) => true,
+            (DownloadError::Other(a), DownloadError::Other(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for DownloadError {}
+
+// 序列化为 Display 字符串（跨进程/持久化友好）；反序列化还原为 `Other(文本)`。
+impl Serialize for DownloadError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DownloadError {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(DownloadError::Other(s))
+    }
 }
 
 /// 下载状态
@@ -61,8 +227,8 @@ pub enum DownloadStatus {
     Completed,
     /// 已取消
     Cancelled,
-    /// 失败
-    Failed(String),
+    /// 失败（携带结构化错误，可程序化匹配 `RequestTimeout`/`ReadTimeout` 等变体）
+    Failed(DownloadError),
 }
 
 /// 下载块信息
@@ -101,10 +267,19 @@ pub struct DownloadStats {
 /// 下载配置
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DownloadConfig {
+    /// 最大并行连接数（并发分块数）。默认 4；最小按 1 处理，避免配置为 0 时
+    /// 没有任何分块并发导致死锁。
     pub max_connections: usize,
+    /// 每个分块的大小（字节）。`0` 表示自动计算（根据文件大小在
+    /// 100KB ~ 10MB 之间动态确定）；非 0 值也会被夹在 100KB ~ 10MB 之间。
     pub chunk_size: u64,
-    pub speed_limit: Option<u64>, // bytes per second
+    /// 总下载速度限制（字节/秒）。`None`（默认）表示不限速；通过
+    /// [`DownloadManager::update_task_config`] 调整后立即生效。
+    pub speed_limit: Option<u64>,
+    /// 是否自动断点续传：任务启动时若检测到本地残留的 `.download_state` 状态文件，
+    /// 自动恢复进度继续下载。默认 `true`。
     pub auto_resume: bool,
+    /// Cookies（`key=value; key2=value2` 形式），仅建连时读取并随请求发送。
     pub cookies: Option<String>,
     /// 连接超时：TCP 建连阶段的最大等待时长。默认 30 秒，用于避免目标不可达时
     /// 无限挂起；区别于 [`DownloadConfig::read_timeout`]（仅覆盖响应头与数据读取，
@@ -116,6 +291,18 @@ pub struct DownloadConfig {
     /// - 探测/分块请求若在超过该时长内未返回响应头，将报错并中止；
     /// - 分块下载读取中若在超过该时长内未收到任何数据，将报错并中止该分块。
     pub read_timeout: Option<Duration>,
+    /// 瞬时错误（请求/读取超时）的最大自动重试次数。默认 3 次；`0` 表示禁用重试。
+    ///
+    /// 超时通常由网络抖动或服务器瞬时过载引起，重试很可能成功。重试按指数退避
+    /// 等待（基数 [`DownloadConfig::retry_base_delay`]，逐次翻倍，封顶
+    /// [`DownloadConfig::retry_max_delay`]），且分块重试会从上次已写入的偏移继续
+    /// （Range 头以 `start + downloaded` 起始），不会重复下载已完成部分。
+    /// HTTP/IO/内容一致性等永久性错误不参与重试，直接失败。
+    pub max_retries: u32,
+    /// 指数退避的起始等待时长。默认 500ms；第 1 次重试前等待该时长，此后每次翻倍。
+    pub retry_base_delay: Duration,
+    /// 指数退避的等待时长上限。默认 10s；翻倍超过该值时封顶，避免重试风暴。
+    pub retry_max_delay: Duration,
 }
 
 impl Default for DownloadConfig {
@@ -128,6 +315,9 @@ impl Default for DownloadConfig {
             cookies: None,
             connect_timeout: Duration::from_secs(30),
             read_timeout: None,
+            max_retries: 3,
+            retry_base_delay: Duration::from_millis(500),
+            retry_max_delay: Duration::from_secs(10),
         }
     }
 }
@@ -237,8 +427,11 @@ fn is_valid_chunks(chunks: &[ChunkInfo], total_size: u64) -> bool {
 pub struct DownloadState {
     /// 状态文件格式版本号
     pub version: u32,
+    /// 下载源 URL（用于校验续传目标是否一致）
     pub url: String,
+    /// 文件总大小（字节）
     pub total_size: u64,
+    /// 各分块进度（恢复下载时据此跳过已下载部分）
     pub chunks: Vec<ChunkInfo>,
 }
 
@@ -255,12 +448,13 @@ pub enum DownloadEvent {
         /// 任务 ID（与 `add_task` 返回值一致）
         task_id: String,
     },
-    /// 任务下载失败（携带失败原因，避免订阅者再单独查询状态）
+    /// 任务下载失败（携带结构化错误，避免订阅者再单独查询状态）
     TaskFailed {
         /// 任务 ID
         task_id: String,
-        /// 失败原因（与 `DownloadStatus::Failed` 的字符串一致）
-        error: String,
+        /// 失败原因（与 `DownloadStatus::Failed` 携带的 `DownloadError` 一致，
+        /// 可直接程序化匹配具体错误变体）
+        error: DownloadError,
     },
     /// 任务被取消
     TaskCancelled {
@@ -280,18 +474,27 @@ pub enum DownloadEvent {
 type ActiveChunks = parking_lot::Mutex<Option<(u64, JoinSet<Result<(), DownloadError>>)>>;
 
 /// 下载任务
+///
+/// `id`/`url`/`download_dir` 是任务的不可变身份与位置信息（公开）；其余字段均为
+/// 内部状态，必须通过 `start`/`pause`/`resume`/`cancel`/`get_status`/`get_stats`/
+/// `get_config`/`update_config`/`filename` 等方法访问，外部不得直接修改——直接改
+/// `status`/`stats`/`config`/`filename` 或内部标志会绕过世代（epoch）等不变量校验，
+/// 导致状态事件不发布、续传错位写坏文件等未定义行为。
 #[derive(Clone)]
 pub struct DownloadTask {
+    /// 任务唯一标识（UUID，由 `new`/`add_task` 生成）
     pub id: Uuid,
+    /// 下载源 URL
     pub url: String,
+    /// 下载文件保存目录
     pub download_dir: PathBuf,
-    pub filename: Arc<Mutex<Option<String>>>,
-    pub config: Arc<RwLock<DownloadConfig>>,
-    pub status: Arc<Mutex<DownloadStatus>>,
-    pub stats: Arc<Mutex<DownloadStats>>,
-    pub is_cancelled: Arc<AtomicBool>,
-    pub is_paused: Arc<AtomicBool>,
-    pub pause_notify: Arc<Notify>,
+    filename: Arc<Mutex<Option<String>>>,
+    config: Arc<RwLock<DownloadConfig>>,
+    status: Arc<Mutex<DownloadStatus>>,
+    stats: Arc<Mutex<DownloadStats>>,
+    is_cancelled: Arc<AtomicBool>,
+    is_paused: Arc<AtomicBool>,
+    pause_notify: Arc<Notify>,
     /// 启动世代（epoch）：每次 `start()` 递增。后台任务在 `start()` 时捕获自己的
     /// 世代值，并于写终止状态/事件/清理文件前校验是否仍是「当前世代」。
     ///
@@ -299,8 +502,8 @@ pub struct DownloadTask {
     /// 与新一代（重启后下载）。若不区分世代，上一代任务会在退出时把新一代刚写入的
     /// `Downloading` 覆盖为 `Cancelled`，并发布一个错误的 `TaskCancelled` 事件、删掉
     /// 新一代正在使用的临时/状态文件。gen 使得过期任务能识别自身并静默退出。
-    pub start_epoch: Arc<AtomicU64>,
-    pub supports_range: Arc<AtomicBool>,
+    start_epoch: Arc<AtomicU64>,
+    supports_range: Arc<AtomicBool>,
     /// 任务启动时间（用于计算整体耗时与速度）
     started_at: Arc<parking_lot::Mutex<Option<Instant>>>,
     /// 全局限速器（所有分块共享，保证总速度不超限）
@@ -396,24 +599,33 @@ impl DownloadTask {
             let client = match task.build_client() {
                 Ok(client) => client,
                 Err(e) => {
-                    task.fail_and_notify(epoch, format!("创建 HTTP 客户端失败: {e}"))
-                        .await;
+                    task.fail_and_notify(epoch, e).await;
                     return;
                 }
             };
 
             // 用 Range 探测请求（bytes=0-0）代替 HEAD：部分服务器不支持 HEAD，
             // 且 HEAD 的 Content-Length 可能与 GET 不一致；206 响应同时证明支持断点续传。
-            // 先拷贝 read_timeout，再 await，避免把 RwLock 读锁守卫跨 await 持有。
-            let read_timeout = task.config.read().read_timeout;
-            let probe_request = client
-                .get(&task.url)
-                .header(reqwest::header::RANGE, "bytes=0-0");
-            let response = match send_request(read_timeout, probe_request).await {
+            // 探测请求同样适用瞬时错误自动重试：服务器瞬时过载时不至于让整个下载失败。
+            // 探测退避与分块重试语义一致——暂停会冻结退避计时、取消/换代立即终止
+            // （返回 Cancelled，进入取消收尾，而不是走失败路径误报 TaskFailed）。
+            // 先拷贝 max_retries/退避参数再 await，避免把 RwLock 读锁守卫跨 await 持有
+            let max_retries = task.config.read().max_retries;
+            let retry_base = task.config.read().retry_base_delay;
+            let retry_max = task.config.read().retry_max_delay;
+            let response = match task
+                .probe_with_retry(&client, epoch, max_retries, retry_base, retry_max)
+                .await
+            {
                 Ok(resp) => resp,
+                Err(DownloadError::Cancelled) => {
+                    // 探测退避期间被取消/换代：取消收尾（状态/事件/快照/清理），
+                    // 不发布虚假的 TaskFailed
+                    task.finish_cancelled(epoch).await;
+                    return;
+                }
                 Err(e) => {
-                    task.fail_and_notify(epoch, format!("HTTP 探测请求失败: {e}"))
-                        .await;
+                    task.fail_and_notify(epoch, e).await;
                     return;
                 }
             };
@@ -426,8 +638,11 @@ impl DownloadTask {
                 && probe_status != reqwest::StatusCode::PARTIAL_CONTENT
                 && !is_empty_file
             {
-                task.fail_and_notify(epoch, format!("HTTP 探测请求失败，状态码: {probe_status}"))
-                    .await;
+                task.fail_and_notify(
+                    epoch,
+                    DownloadError::Other(format!("HTTP 探测请求失败，状态码: {probe_status}")),
+                )
+                .await;
                 return;
             }
 
@@ -451,8 +666,7 @@ impl DownloadTask {
 
             // 确保下载目录存在
             if let Err(e) = tokio::fs::create_dir_all(&task.download_dir).await {
-                task.fail_and_notify(epoch, format!("创建目录失败: {e}"))
-                    .await;
+                task.fail_and_notify(epoch, e.into()).await;
                 return;
             }
 
@@ -526,7 +740,7 @@ impl DownloadTask {
                     // 与 cancel() 设置的状态保持一致，避免后台任务退出时把
                     // 刚设置的 Cancelled 覆盖成 Failed
                     Err(DownloadError::Cancelled) => DownloadStatus::Cancelled,
-                    Err(e) => DownloadStatus::Failed(format!("下载失败: {}", e)),
+                    Err(e) => DownloadStatus::Failed(e),
                 }
             };
             let is_cancelled = *status == DownloadStatus::Cancelled;
@@ -599,12 +813,12 @@ impl DownloadTask {
     /// `epoch` 为本后台任务在 `start()` 时捕获的启动世代；若在 await 期间已发生
     /// 新的 `start()`（世代被递增），则本任务已过期，跳过状态/事件写入，避免覆盖
     /// 新一代任务的状态。
-    async fn fail_and_notify(&self, epoch: u64, msg: String) {
+    async fn fail_and_notify(&self, epoch: u64, error: DownloadError) {
         let mut status = self.status.lock().await;
         if self.start_epoch.load(Ordering::Acquire) != epoch {
             return;
         }
-        *status = DownloadStatus::Failed(msg.clone());
+        *status = DownloadStatus::Failed(error.clone());
         drop(status);
 
         // 在持有 stats 锁时复查世代并同步发布（send_replace 无 await），避免
@@ -622,8 +836,87 @@ impl DownloadTask {
         // 同步发布失败事件（错误信息与 DownloadStatus::Failed 保持一致）
         let _ = self.event_tx.send(DownloadEvent::TaskFailed {
             task_id: self.id.to_string(),
-            error: msg,
+            error,
         });
+    }
+
+    /// 取消收尾：确认世代后写入取消状态、发布取消事件与最终快照、清理残留文件。
+    ///
+    /// 用于「探测退避期间被取消」等**尚未进入分块下载**的取消路径：`cancel()` 只负责
+    /// 置位状态与中止分块，事件/快照/清理统一在这里完成，否则订阅者会永远等不到
+    /// 终止通知（进度通道不关闭、`TaskCancelled` 事件不发布）。
+    async fn finish_cancelled(&self, epoch: u64) {
+        let mut status = self.status.lock().await;
+        if self.start_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        *status = DownloadStatus::Cancelled;
+        let event = DownloadEvent::TaskCancelled {
+            task_id: self.id.to_string(),
+        };
+        drop(status);
+        let _ = self.event_tx.send(event);
+
+        // 清理前再次校验世代（与主终态路径一致）：期间若发生新的 start()，本代已
+        // 过期，不得删除新一代正在使用的临时/状态文件。
+        if self.start_epoch.load(Ordering::Acquire) != epoch {
+            return;
+        }
+        // 探测阶段尚未写入任何文件，remove_file 均为无害 no-op；防御性清理
+        let _ = tokio::fs::remove_file(self.get_state_file_path().await).await;
+        let _ = tokio::fs::remove_file(self.get_output_path().await).await;
+
+        // 在持有 stats 锁时复查世代并同步发布（与 fail_and_notify 一致），避免
+        // 「复查 epoch → 获取 stats 锁」之间被新的 start() 抢占。
+        {
+            let stats = self.stats.lock().await;
+            if self.start_epoch.load(Ordering::Acquire) != epoch {
+                return;
+            }
+            self.progress_tx.send_replace(stats.clone());
+        }
+    }
+
+    /// 带重试地发送探测请求（`Range: bytes=0-0`），退避休眠可被暂停中断（冻结计时）、
+    /// 取消/换代立即终止——与分块重试（[`DownloadTask::download_chunk`]）语义一致。
+    ///
+    /// 暂停发生在探测退避窗口内时，退避计时被冻结、不再发出下一次探测请求，恢复后
+    /// 按剩余时间继续；取消/换代返回 `Cancelled`，由调用方（`start()`）进入取消收尾。
+    async fn probe_with_retry(
+        &self,
+        client: &Client,
+        epoch: u64,
+        max_retries: u32,
+        base: Duration,
+        max: Duration,
+    ) -> Result<reqwest::Response, DownloadError> {
+        let mut attempt = 0u32;
+        loop {
+            // 退避等待期间可能已发生取消/重启：发起新请求前先校验世代，
+            // 避免浪费带宽向一个已过期的任务发送请求
+            if self.should_stop(epoch) {
+                return Err(DownloadError::Cancelled);
+            }
+            let read_timeout = self.config.read().read_timeout;
+            let probe_request = client
+                .get(&self.url)
+                .header(reqwest::header::RANGE, "bytes=0-0");
+            match send_request(read_timeout, probe_request).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) if e.is_retryable() && attempt < max_retries => {
+                    attempt += 1;
+                    let backoff = retry_backoff(attempt, base, max);
+                    warn!(
+                        "探测请求遇到瞬时错误({e})，第 {attempt}/{max_retries} 次重试，等待 {}ms",
+                        backoff.as_millis()
+                    );
+                    // 退避休眠可被暂停中断并冻结计时（与分块重试一致）；
+                    // 取消/换代返回 Cancelled
+                    self.sleep_interruptible_by_pause(backoff, epoch).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// 设置文件名
@@ -766,7 +1059,16 @@ impl DownloadTask {
         let mut index = 0;
 
         while start < total_size {
-            let end = (start + chunk_size - 1).min(total_size.saturating_sub(1));
+            // 用饱和加法计算末块区间，防止 `start + chunk_size - 1` 溢出 u64：
+            // `total_size` 源自服务器的 Content-Range，极端（恶意/损坏）值如
+            // u64::MAX 时末块计算会越过 u64 上界——debug 下直接 panic，release
+            // 下回绕成极小值生成错误分块。后台任务 panic 不会传播（见
+            // fail_and_notify），任务会永久卡在 Downloading；饱和加法保证无论
+            // 服务器上报多大，都只生成覆盖 [0, total_size) 的连续分块，
+            // 正常大小下与普通加法行为完全一致。
+            let end = start
+                .saturating_add(chunk_size - 1)
+                .min(total_size.saturating_sub(1));
 
             chunks.push(ChunkInfo {
                 index,
@@ -776,6 +1078,7 @@ impl DownloadTask {
                 completed: false,
             });
 
+            // end ≤ total_size - 1 ≤ u64::MAX - 1，故 end + 1 不会溢出
             start = end + 1;
             index += 1;
         }
@@ -982,6 +1285,20 @@ impl DownloadTask {
             return Err(DownloadError::Cancelled);
         }
 
+        // 未知大小下载（服务器未给出 Content-Length / 开放区间块 end == u64::MAX）
+        // 期间 total_size 恒为 0；全部下载完成后补写实际字节数，让最终快照与
+        // 后续 get_stats 的统计更准确（此前用户看到的是 total_size=0 与满下载量并存）。
+        // 在持有 stats 锁时复查世代：若期间发生「取消后立即重启」，不得污染新一代统计。
+        {
+            let mut stats = self.stats.lock().await;
+            if self.start_epoch.load(Ordering::Acquire) == epoch
+                && stats.total_size == 0
+                && stats.downloaded > 0
+            {
+                stats.total_size = stats.downloaded;
+            }
+        }
+
         // 改为最终文件名
         let from = self.get_output_path().await;
         let to = self.download_dir.join(self.get_filename().await);
@@ -1002,11 +1319,16 @@ impl DownloadTask {
     }
 
     /// 下载单个块
+    ///
+    /// 对瞬时错误（请求/读取超时）按配置的 [`DownloadConfig::max_retries`] 自动重试：
+    /// 每次尝试从 `chunk.start + chunk.downloaded` 重新发起 Range 请求，接着上次已写入
+    /// 的字节续传，不重复下载已完成部分。重试间按指数退避等待（见 [`retry_backoff`]），
+    /// 给瞬时过载的服务器恢复时间；永久性错误不重试，直接向上传播。
     async fn download_chunk(
         &self,
         client: &Client,
         mut chunk: ChunkInfo,
-        reused_response: Option<reqwest::Response>,
+        mut reused_response: Option<reqwest::Response>,
         epoch: u64,
     ) -> Result<(), DownloadError> {
         if chunk.completed {
@@ -1014,7 +1336,65 @@ impl DownloadTask {
         }
 
         let supports_range = self.supports_range.load(Ordering::Relaxed);
+        let max_retries = self.config.read().max_retries;
+        let retry_base = self.config.read().retry_base_delay;
+        let retry_max = self.config.read().retry_max_delay;
 
+        let mut attempt = 0u32;
+        loop {
+            // 重试退避等待期间可能已发生取消/重启：发起新请求前先校验世代，
+            // 避免浪费带宽向一个已过期的任务发送请求
+            if self.should_stop(epoch) {
+                return Err(DownloadError::Cancelled);
+            }
+
+            match self
+                .download_chunk_attempt(
+                    client,
+                    &mut chunk,
+                    supports_range,
+                    reused_response.take(),
+                    epoch,
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is_retryable() && attempt < max_retries => {
+                    attempt += 1;
+                    let backoff = retry_backoff(attempt, retry_base, retry_max);
+                    warn!(
+                        "分块 {} 遇到瞬时错误({e})，第 {attempt}/{max_retries} 次重试，等待 {}ms",
+                        chunk.index,
+                        backoff.as_millis()
+                    );
+                    // 退避休眠可被暂停中断：若暂停发生在退避窗口内，立即进入暂停等待
+                    // 并冻结退避计时，恢复后再按剩余时间继续。否则 pause() 在退避窗口
+                    // 内会「看似失效」——需等满整个退避（最长 retry_max_delay）重试请求
+                    // 才发出，期间下载仍在后台推进，违背暂停即停的语义。
+                    self.sleep_interruptible_by_pause(backoff, epoch).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// 分块下载的单次尝试：获取响应 -> 校验 -> 读完整块。
+    ///
+    /// 成功（块完整写入）返回 `Ok(())`；失败返回错误，其中超时类
+    /// （`RequestTimeout`/`ReadTimeout`）由 [`DownloadTask::download_chunk`] 的重试
+    /// 循环决定是否重试，其余错误视为永久性直接失败。
+    ///
+    /// 失败后 `chunk.downloaded` 保留已写入的字节数，重试时以 `start + downloaded`
+    /// 作为 Range 起始续传。`reused_response` 仅在首次尝试时可用（非范围服务器复用
+    /// 探测响应体），重试时置空、重新发起完整请求。
+    async fn download_chunk_attempt(
+        &self,
+        client: &Client,
+        chunk: &mut ChunkInfo,
+        supports_range: bool,
+        reused_response: Option<reqwest::Response>,
+        epoch: u64,
+    ) -> Result<(), DownloadError> {
         // 复用探测响应（服务器不支持范围时，探测请求已返回 200 + 全量载荷），
         // 否则按需发起 Range/完整请求
         let mut response = match reused_response {
@@ -1099,6 +1479,16 @@ impl DownloadTask {
             .open(output_path)
             .await?;
 
+        // 非范围服务器无法按 Range 续传：重试/续传发起的都是「从头开始」的完整请求，
+        // 不能沿用上一次失败尝试已写入的偏移。若首次尝试已部分写入（如 read_timeout），
+        // 需重置 `chunk.downloaded` 并清空文件，否则全量响应会被写到 `start+downloaded`
+        // 之后——字节计数超预期使任务以「分块大小不匹配」永久失败（而非重试成功），
+        // 严重时更会错位写入、损坏文件。
+        if !supports_range {
+            chunk.downloaded = 0;
+            file.set_len(0).await?;
+        }
+
         // 块内顺序写入，定位一次即可
         file.seek(std::io::SeekFrom::Start(chunk.start + chunk.downloaded))
             .await?;
@@ -1136,8 +1526,11 @@ impl DownloadTask {
             let mut stats = self.stats.lock().await;
             stats.downloaded += chunk_data.len() as u64;
 
-            // 更新块信息
-            if let Some(stat_chunk) = stats.chunks.iter_mut().find(|c| c.index == chunk.index) {
+            // 更新块信息。stats.chunks 恒按 index 连续排列（create_chunks 从 0 递增生成；
+            // 续传恢复经 is_valid_chunks 校验 index == 迭代位置），因此可按 index 直接索引，
+            // 避免对每个网络块做 O(n) 线性查找（大文件分块可达上千，逐块写放大明显）。
+            // get_mut 返回 Option，防御性保留越界时的静默跳过，与原 find 语义一致。
+            if let Some(stat_chunk) = stats.chunks.get_mut(chunk.index) {
                 stat_chunk.downloaded = chunk.downloaded;
             }
 
@@ -1210,10 +1603,10 @@ impl DownloadTask {
             )));
         }
 
-        // 标记块完成
+        // 标记块完成（分块按 index 连续排列，直接索引，见 download_chunk_attempt 内注释）
         if !self.should_stop(epoch) {
             let mut stats = self.stats.lock().await;
-            if let Some(stat_chunk) = stats.chunks.iter_mut().find(|c| c.index == chunk.index) {
+            if let Some(stat_chunk) = stats.chunks.get_mut(chunk.index) {
                 stat_chunk.completed = true;
                 stat_chunk.downloaded = chunk.downloaded;
             }
@@ -1261,6 +1654,51 @@ impl DownloadTask {
             notified.await;
             if self.should_stop(epoch) {
                 return Err(DownloadError::Cancelled);
+            }
+        }
+    }
+
+    /// 退避休眠，但可被暂停/恢复中断（与 [`wait_while_paused`] 同源的 `Notify` 机制）。
+    ///
+    /// 在 [`DownloadTask::download_chunk`] 的重试退避等待中调用：
+    /// - 暂停发生在退避窗口内时，立即进入暂停等待并**冻结**退避计时（暂停时长不计入
+    ///   退避，恢复后按剩余时间继续），保证 `pause()` 在重试退避期间也即时生效；
+    /// - 恢复后扣除已流逝的退避时间继续倒计时，期满返回 `Ok`；
+    /// - 取消/换代时返回 `Cancelled`。
+    ///
+    /// 与 [`wait_while_paused`] 一样，先创建 `notified()` future 再检查暂停标志，
+    /// 避免 `pause`/`resume`/`cancel` 的通知落在「检查标志」与「注册 waiter」之间丢失。
+    async fn sleep_interruptible_by_pause(
+        &self,
+        duration: Duration,
+        epoch: u64,
+    ) -> Result<(), DownloadError> {
+        let mut remaining = duration;
+        loop {
+            if self.should_stop(epoch) {
+                return Err(DownloadError::Cancelled);
+            }
+            // 先注册通知再检查标志（同 wait_while_paused），避免丢失唤醒
+            let notified = self.pause_notify.notified();
+            if self.is_paused.load(Ordering::Relaxed) {
+                // 已暂停且已取消/被新世代取代：与 wait_while_paused 相同的
+                // 提前检查，防止通知先于本 waiter 注册而永久挂起
+                if self.should_stop(epoch) {
+                    return Err(DownloadError::Cancelled);
+                }
+                notified.await;
+                continue; // 冻结期间不计入退避，恢复后按剩余时间继续
+            }
+            if remaining == Duration::ZERO {
+                return Ok(());
+            }
+            let began = Instant::now();
+            tokio::select! {
+                // 被 pause/resume/cancel 唤醒：扣除已流逝的退避时间，回到顶部重新判断
+                _ = notified => {
+                    remaining = remaining.saturating_sub(began.elapsed());
+                }
+                _ = sleep(remaining) => return Ok(()),
             }
         }
     }
@@ -1665,6 +2103,14 @@ impl DownloadManager {
         self.event_tx.subscribe()
     }
 
+    /// 列出当前管理器中所有任务的 ID（按字典序排序，保证遍历顺序稳定）。
+    /// 任务 ID 是 UUID 字符串，可与 `get_task_status`/`get_task_stats` 等配合使用。
+    pub async fn list_tasks(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.tasks.lock().await.keys().cloned().collect();
+        ids.sort();
+        ids
+    }
+
     /// 添加下载任务
     pub async fn add_task(
         &self,
@@ -1783,8 +2229,7 @@ impl DownloadManager {
                 // 下载的临时文件删掉，导致最终文件丢失。正确语义是等待收尾完成
                 // （有界等待），而非取消；只有真正未完成的下载才直接取消。
                 let stats = task.get_stats().await;
-                let fully_downloaded =
-                    stats.total_size > 0 && stats.downloaded >= stats.total_size;
+                let fully_downloaded = stats.total_size > 0 && stats.downloaded >= stats.total_size;
                 if fully_downloaded {
                     // 有界等待后台任务进入终态（rename 为本地磁盘操作，通常毫秒级）
                     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1909,6 +2354,19 @@ async fn next_chunk<T>(
         },
         None => chunk.await.map_err(DownloadError::from),
     }
+}
+
+/// 计算第 `attempt` 次重试前的等待时长（指数退避）。
+///
+/// 从 `base` 起步，每次重试翻倍，封顶 `max`。`attempt` 从 1 开始计（第 1 次
+/// 重试等待 `base`）。退避让瞬时过载的服务器有时间恢复，同时避免重试风暴；
+/// 基数与上限可经 [`DownloadConfig::retry_base_delay`] /
+/// [`DownloadConfig::retry_max_delay`] 配置。
+fn retry_backoff(attempt: u32, base: Duration, max: Duration) -> Duration {
+    // 2^20 倍（约 100 万倍）已远超任何合理上限，再大没有意义且会触发 u32 移位溢出。
+    // 极端基数（如 1ms）也能经封顶正确触顶，无需特殊分支。
+    let shift = attempt.saturating_sub(1).min(20);
+    base.saturating_mul(1u32 << shift).min(max)
 }
 
 /// 从 Content-Range 响应头中解析总大小
@@ -2185,6 +2643,76 @@ mod tests {
         assert_eq!(task.download_dir, PathBuf::from("."));
     }
 
+    #[test]
+    fn test_download_error_partial_eq_semantics() {
+        use std::io::ErrorKind;
+
+        // 相同变体 + 相同载荷 => 相等
+        assert_eq!(
+            DownloadError::Other("x".to_string()),
+            DownloadError::Other("x".to_string())
+        );
+        assert_eq!(DownloadError::Cancelled, DownloadError::Cancelled);
+        assert_eq!(DownloadError::RequestTimeout, DownloadError::RequestTimeout);
+        // `Other` 直接按字符串比较（不经 Display 往返，前缀不参与）
+        assert_ne!(
+            DownloadError::Other("x".to_string()),
+            DownloadError::Other("y".to_string())
+        );
+        // 相同变体但内部错误文本不同 => 不等（Arc 包裹，退化为文本比较）
+        let io_a: DownloadError = std::io::Error::new(ErrorKind::NotFound, "a").into();
+        let io_b: DownloadError = std::io::Error::new(ErrorKind::NotFound, "b").into();
+        assert_ne!(io_a, io_b);
+        assert_eq!(io_a.clone(), io_a);
+        // 不同变体 => 不等（即使 Display 文本可能相似，前缀不同不会误判）
+        assert_ne!(DownloadError::Cancelled, DownloadError::TaskNotFound);
+        assert_ne!(
+            DownloadError::RequestTimeout,
+            DownloadError::Other("请求超时：服务器未在限定时长内返回响应".to_string())
+        );
+        // 与旧实现（Display 文本相等即相等）语义保持一致：空 Other 与任意变体不等
+        assert_ne!(
+            DownloadError::Other(String::new()),
+            DownloadError::ReadTimeout
+        );
+    }
+
+    #[test]
+    fn test_download_error_is_retryable_only_for_timeouts() {
+        // 超时类（瞬时/可重试）
+        assert!(DownloadError::RequestTimeout.is_retryable());
+        assert!(DownloadError::ReadTimeout.is_retryable());
+        // 用户主动/永久性错误不可重试
+        assert!(!DownloadError::Cancelled.is_retryable());
+        assert!(!DownloadError::TaskNotFound.is_retryable());
+        assert!(!DownloadError::InvalidStateFile.is_retryable());
+        assert!(!DownloadError::Other("自定义错误".to_string()).is_retryable());
+    }
+
+    #[test]
+    fn test_download_error_serde_roundtrip() {
+        // 无载荷变体：序列化为 Display 文本（JSON 字符串）
+        assert_eq!(
+            serde_json::to_string(&DownloadError::Cancelled).unwrap(),
+            serde_json::to_string("下载被取消").unwrap(),
+        );
+        // 带载荷变体：文本拼入 Display
+        let json = serde_json::to_string(&DownloadError::Other("x".to_string())).unwrap();
+        assert_eq!(json, serde_json::to_string("其他错误: x").unwrap());
+        // 反序列化恒还原为 Other(文本)——丢失原变体是文档化语义
+        let restored: DownloadError = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, DownloadError::Other("其他错误: x".to_string()));
+        // DownloadStatus::Failed 整体可往返（状态文件/持久化场景）
+        let status = DownloadStatus::Failed(DownloadError::RequestTimeout);
+        let status_json = serde_json::to_string(&status).unwrap();
+        match serde_json::from_str::<DownloadStatus>(&status_json).unwrap() {
+            DownloadStatus::Failed(DownloadError::Other(s)) => {
+                assert!(s.contains("请求超时"), "还原文本应含超时语义: {s}")
+            }
+            other => panic!("应还原为 Failed(Other), 得到 {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_pause_is_noop_when_not_downloading() {
         let task = DownloadTask::new(
@@ -2297,11 +2825,12 @@ mod tests {
         assert!(!task.is_cancelled.load(Ordering::Relaxed));
 
         // 已失败的任务同理：保留失败原因，而非回退为 Cancelled
-        *task.status.lock().await = DownloadStatus::Failed("下载失败".to_string());
+        *task.status.lock().await =
+            DownloadStatus::Failed(DownloadError::Other("下载失败".to_string()));
         task.cancel().await;
         assert_eq!(
             task.get_status().await,
-            DownloadStatus::Failed("下载失败".to_string())
+            DownloadStatus::Failed(DownloadError::Other("下载失败".to_string()))
         );
         assert!(!task.is_cancelled.load(Ordering::Relaxed));
     }
@@ -2319,7 +2848,8 @@ mod tests {
 
         // 模拟后台任务在进入分块下载之前失败（探测/建客户端/建目录失败）；
         // 该任务从未 start()，其启动世代为 0
-        task.fail_and_notify(0, "模拟前置失败".to_string()).await;
+        task.fail_and_notify(0, DownloadError::Other("模拟前置失败".to_string()))
+            .await;
 
         // 订阅者应收到一次新的统计快照，而不是一直等待一个永不发出的通知
         tokio::time::timeout(Duration::from_secs(2), progress.changed())
@@ -2329,7 +2859,7 @@ mod tests {
 
         assert_eq!(
             task.get_status().await,
-            DownloadStatus::Failed("模拟前置失败".to_string())
+            DownloadStatus::Failed(DownloadError::Other("模拟前置失败".to_string()))
         );
     }
 
@@ -2347,7 +2877,8 @@ mod tests {
         task.start_epoch.fetch_add(1, Ordering::AcqRel);
 
         // 上一代后台任务（世代 0）迟到的失败通知应被忽略，不得覆盖新一代状态
-        task.fail_and_notify(0, "陈旧任务的失败".to_string()).await;
+        task.fail_and_notify(0, DownloadError::Other("陈旧任务的失败".to_string()))
+            .await;
 
         assert_eq!(task.get_status().await, DownloadStatus::Downloading);
     }
@@ -2455,7 +2986,8 @@ mod tests {
 
         // 模拟下载失败后的残留：断点续传会为后续重试保留临时/状态文件
         let task = manager.tasks.lock().await.get(&task_id).unwrap().clone();
-        *task.status.lock().await = DownloadStatus::Failed("mock".to_string());
+        *task.status.lock().await =
+            DownloadStatus::Failed(DownloadError::Other("mock".to_string()));
         *task.filename.lock().await = Some("file.txt".to_string());
 
         let temp_path = temp_dir.path().join("file.txt.temp");
@@ -2882,10 +3414,49 @@ mod tests {
             cookies: Some("session=abc".to_string()),
             connect_timeout: Duration::from_secs(45),
             read_timeout: Some(Duration::from_secs(15)),
+            max_retries: 5,
+            retry_base_delay: Duration::from_millis(250),
+            retry_max_delay: Duration::from_secs(5),
         };
         task.update_config(expected.clone());
 
         assert_eq!(task.config.read().clone(), expected);
+    }
+
+    #[test]
+    fn test_max_retries_default_and_backoff() {
+        // 硬约束：默认开启 3 次瞬时错误自动重试（0 表示禁用）
+        assert_eq!(DownloadConfig::default().max_retries, 3);
+        // 退避默认值：基数 500ms、上限 10s
+        assert_eq!(
+            DownloadConfig::default().retry_base_delay,
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            DownloadConfig::default().retry_max_delay,
+            Duration::from_secs(10)
+        );
+
+        // 默认参数下：指数退避，首次 500ms，随后逐次翻倍，封顶 10 秒
+        let base = DownloadConfig::default().retry_base_delay;
+        let max = DownloadConfig::default().retry_max_delay;
+        assert_eq!(retry_backoff(1, base, max), Duration::from_millis(500));
+        assert_eq!(retry_backoff(2, base, max), Duration::from_millis(1000));
+        assert_eq!(retry_backoff(3, base, max), Duration::from_millis(2000));
+        assert_eq!(retry_backoff(5, base, max), Duration::from_millis(8000));
+        // 第 6 次起达到 10s 上限，不再增长
+        assert_eq!(retry_backoff(6, base, max), Duration::from_millis(10_000));
+        assert_eq!(retry_backoff(100, base, max), Duration::from_millis(10_000));
+
+        // 自定义基数/上限：100ms 起、封顶 500ms
+        let fast = Duration::from_millis(100);
+        let cap = Duration::from_millis(500);
+        assert_eq!(retry_backoff(1, fast, cap), Duration::from_millis(100));
+        assert_eq!(retry_backoff(2, fast, cap), Duration::from_millis(200));
+        assert_eq!(retry_backoff(3, fast, cap), Duration::from_millis(400));
+        // 100 * 2^3 = 800 > 500，封顶到上限
+        assert_eq!(retry_backoff(4, fast, cap), Duration::from_millis(500));
+        assert_eq!(retry_backoff(10, fast, cap), Duration::from_millis(500));
     }
 
     #[tokio::test]

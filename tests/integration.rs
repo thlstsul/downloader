@@ -143,33 +143,47 @@ fn respond(stream: &mut TcpStream, status: &str, body: &[u8]) {
 /// 启动一个对任意请求都返回指定状态码（如 `404 Not Found`）的 mock 服务器，
 /// 用于验证「探测请求返回非 2xx 状态码」时任务进入 Failed 的错误路径。
 fn spawn_status_server(status: &'static str) -> String {
+    spawn_status_server_counting(status).0
+}
+
+/// 启动一个对任意请求都返回指定状态码的 mock 服务器，并统计接受的连接总数，
+/// 用于验证永久性错误（非超时类）不会触发自动重试（连接数恒为 1）。
+fn spawn_status_server_counting(status: &'static str) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
     let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+
+    let counter = Arc::clone(&connections);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { continue };
-            // 读取完整请求头（GET 无请求体）后统一返回指定错误状态码
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-            loop {
-                match stream.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                            break;
+            let Ok(stream) = stream else { continue };
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut stream = stream;
+                // 读取完整请求头（GET 无请求体）后统一返回指定错误状态码
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
                         }
+                        Err(_) => break,
                     }
-                    Err(_) => break,
                 }
-            }
-            let header =
-                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.flush();
+                let header =
+                    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.flush();
+            });
         }
     });
-    format!("http://{addr}/file.bin")
+    (format!("http://{addr}/file.bin"), connections)
 }
 
 /// 并发连接跟踪器：记录 mock 服务器上「同一时刻打开」的 TCP 连接数峰值。
@@ -492,6 +506,77 @@ fn handle_ignore_range_connection(mut stream: TcpStream, data: &[u8]) {
             return;
         }
     }
+}
+
+/// 启动一个「前 `hang_connections` 个连接只回一半字节便挂起、之后完整返回」的非范围服务器。
+///
+/// 服务器忽略 Range、总返回 200 + 全量载荷（与 [`spawn_ignore_range_server`] 一致）。
+/// 前 `hang_connections` 个连接在声明完整 Content-Length 后只发送约一半字节即挂起，
+/// 触发客户端 `read_timeout`；之后的连接完整返回全量载荷，供重试成功。返回 URL 与
+/// 「已接受的连接总数」计数器。
+///
+/// 用于端到端验证：非范围服务器在下载中途超时进入重试后，重试发起的是全新完整请求，
+/// 必须从偏移 0 从头写起（不能按 `chunk.downloaded` 续传），否则数据错位、任务失败。
+fn spawn_nonrange_half_then_full_server(
+    data: Vec<u8>,
+    hang_connections: usize,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
+    let addr = listener.local_addr().unwrap();
+    let data = Arc::new(data);
+    let connections = Arc::new(AtomicUsize::new(0));
+
+    let data_inner = Arc::clone(&data);
+    let counter = Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let data = Arc::clone(&data_inner);
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= hang_connections {
+                    handle_half_then_hang(stream, &data);
+                } else {
+                    handle_ignore_range_connection(stream, &data);
+                }
+            });
+        }
+    });
+
+    (format!("http://{addr}/file.bin"), connections)
+}
+
+/// 读取请求头后返回 200 + 完整 Content-Length，但只发送一半字节，随后挂起
+/// （不关闭连接），等待客户端因 `read_timeout` 关闭。
+fn handle_half_then_hang(mut stream: TcpStream, data: &[u8]) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        data.len()
+    );
+    if stream.write_all(header.as_bytes()).is_err() {
+        return;
+    }
+    if stream.write_all(&data[..data.len() / 2]).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+    std::thread::park();
 }
 
 /// 启动一个「不返回 Content-Length」的服务器：忽略 Range，总返回 200 + 全量载荷，
@@ -841,6 +926,56 @@ async fn test_non_range_server_fallback_against_local_server() {
 
     let output = std::fs::read(dir.path().join("file.bin")).expect("读取下载文件失败");
     assert_eq!(output, data, "非范围服务器下载内容应与服务端载荷一致");
+}
+
+/// 验证非范围服务器在下载中途超时进入重试后，重试的完整请求从头写起、最终成功。
+///
+/// 非范围服务器（忽略 Range、总返回 200 全量）不支持断点续传，重试发起的必然是
+/// 全新完整请求。若重试沿用首次尝试已写入的 `chunk.downloaded` 偏移（如复用探测
+/// 响应体读到一半触发 `read_timeout`），全量响应会被写到 `start+downloaded` 之后，
+/// 字节计数超预期，任务以「分块大小不匹配」永久失败——而非重试成功。此用例用
+/// 「首个连接只回一半字节便挂起」的服务器精确制造该时序，断言重试后任务 Completed
+/// 且文件内容与原数据字节级一致。
+#[tokio::test]
+async fn test_nonrange_mid_download_retry_restarts_from_scratch() {
+    let data = test_data(200 * 1024);
+    // 首个连接（探测，返回 200 全量响应体供复用）只回一半字节后挂起，触发
+    // read_timeout；之后的连接完整返回全量载荷，供重试成功。
+    let (url, connections) = spawn_nonrange_half_then_full_server(data.clone(), 1);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(200)),
+        max_retries: 3,
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(30)).await {
+        DownloadStatus::Completed => {}
+        DownloadStatus::Failed(reason) => {
+            panic!("非范围服务器中途超时重试应从头重下并成功，实际失败: {reason}")
+        }
+        other => panic!("非范围服务器中途超时重试应成功，实际: {other:?}"),
+    }
+
+    assert!(
+        connections.load(Ordering::SeqCst) >= 2,
+        "中途超时应触发至少 1 次重试（连接数 ≥ 2），实际: {}",
+        connections.load(Ordering::SeqCst)
+    );
+
+    let output = std::fs::read(dir.path().join("file.bin")).expect("读取下载文件失败");
+    assert_eq!(
+        output, data,
+        "非范围服务器重试后文件内容应与原数据字节级一致"
+    );
 }
 
 /// 验证「200 响应无 Content-Length」（chunked/流式、总大小未知）时仍能正确下载。
@@ -1264,12 +1399,18 @@ async fn test_cancel_then_immediately_restart_preserves_integrity() {
         .add_task(url, dir.path().to_path_buf(), config)
         .await;
 
-    manager.start_task(&task_id).await.expect("首次开始下载失败");
+    manager
+        .start_task(&task_id)
+        .await
+        .expect("首次开始下载失败");
 
     // 等待产生初步进度后取消，随后立即重启同一任务
     tokio::time::sleep(Duration::from_secs(1)).await;
     manager.cancel_task(&task_id).await;
-    manager.start_task(&task_id).await.expect("取消后立即重启失败");
+    manager
+        .start_task(&task_id)
+        .await
+        .expect("取消后立即重启失败");
 
     // 重启后的任务应最终进入 Completed（而非被旧世代误 abort 导致 Failed/残缺）
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(30)).await {
@@ -1350,7 +1491,10 @@ async fn test_read_timeout_on_hanging_server() {
 
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
         DownloadStatus::Failed(reason) => {
-            assert!(reason.contains("超时"), "失败原因应包含超时信息: {reason}");
+            assert!(
+                reason.to_string().contains("超时"),
+                "失败原因应包含超时信息: {reason}"
+            );
         }
         other => panic!("挂起服务器应导致下载失败，实际: {other:?}"),
     }
@@ -1458,6 +1602,182 @@ fn handle_mid_download_hang(mut stream: TcpStream, data: &[u8]) {
     }
 }
 
+/// 启动一个「前 N 个请求完全不响应（挂起连接）、之后正常响应」的服务器。
+///
+/// 用于端到端验证探测请求（bytes=0-0）的瞬时错误自动重试：探测在前 N 次请求时
+/// 因 `read_timeout` 失败，之后重试成功并继续完成整个下载。返回 URL 与
+/// 「已接受的连接总数」计数器（= 原始尝试 + 重试次数）。
+fn spawn_retry_then_succeed_server(
+    data: Vec<u8>,
+    hang_requests: usize,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
+    let addr = listener.local_addr().unwrap();
+    let data = Arc::new(data);
+    let requests = Arc::new(AtomicUsize::new(0));
+
+    let data_inner = Arc::clone(&data);
+    let counter = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let data = Arc::clone(&data_inner);
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= hang_requests {
+                    // 接受连接但不发送任何字节，等待客户端因 read_timeout 关闭连接
+                    let mut stream = stream;
+                    let mut discard = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut discard) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                } else {
+                    handle_connection(stream, &data, Arc::new(Mutex::new(Vec::new())));
+                }
+            });
+        }
+    });
+
+    (format!("http://{addr}/file.bin"), requests)
+}
+
+/// 启动一个「探测正常、前 N 个分块请求只回一半字节便挂起、之后正常响应」的服务器。
+///
+/// 用于端到端验证分块级自动重试 + 续传：首个分块读取到一半触发 `read_timeout`，
+/// 重试请求以 `start + downloaded` 续传，最终字节级一致。探测（bytes=0-0）始终
+/// 正常响应，不计入挂起配额。返回 URL 与「收到的分块请求总数」计数器
+/// （= 正常分块数 + 超时后的续传重试请求数）。
+fn spawn_chunk_retry_then_succeed_server(
+    data: Vec<u8>,
+    hang_chunks: usize,
+) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口失败");
+    let addr = listener.local_addr().unwrap();
+    let data = Arc::new(data);
+    let chunk_requests = Arc::new(AtomicUsize::new(0));
+
+    let data_inner = Arc::clone(&data);
+    let counter = Arc::clone(&chunk_requests);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let data = Arc::clone(&data_inner);
+            let counter = Arc::clone(&counter);
+            std::thread::spawn(move || handle_chunk_retry(stream, &data, hang_chunks, counter));
+        }
+    });
+
+    (format!("http://{addr}/file.bin"), chunk_requests)
+}
+
+/// 处理「分块重试」服务器的单个连接：
+/// - 探测（bytes=0-0）：完整返回 1 字节，保证探测成功、进入分块阶段；
+/// - 分块请求：计数。若计数 ≤ hang_chunks，声明完整 Content-Length 但只回一半
+///   字节后保持连接挂起（等待客户端因 read_timeout 关闭），触发读取超时；
+///   否则完整返回请求区间，供重试续传成功。
+fn handle_chunk_retry(
+    mut stream: TcpStream,
+    data: &[u8],
+    hang_chunks: usize,
+    counter: Arc<AtomicUsize>,
+) {
+    let total = data.len();
+    let mut buf = Vec::new();
+    let mut read_buf = [0u8; 8192];
+
+    loop {
+        buf.clear();
+        loop {
+            match stream.read(&mut read_buf) {
+                Ok(0) => return, // 客户端关闭
+                Ok(n) => {
+                    buf.extend_from_slice(&read_buf[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+
+        let request = String::from_utf8_lossy(&buf).to_lowercase();
+        let range_spec = request
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("range:").map(str::trim));
+
+        let Some(spec) = range_spec else {
+            // 无 Range 请求（不应出现，探测也带 Range）：全量响应后关闭
+            let header =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(data);
+            let _ = stream.flush();
+            return;
+        };
+
+        let spec = spec.strip_prefix("bytes=").unwrap_or(spec);
+        let first = spec.split(',').next().unwrap_or("");
+        let Some((a, b)) = first.split_once('-') else {
+            return;
+        };
+        let start: usize = a.trim().parse().unwrap_or(0);
+
+        // 探测请求：完整返回，不计入挂起配额
+        if a.trim() == "0" && b.trim() == "0" && start < total {
+            let header = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{total}\r\nConnection: keep-alive\r\n\r\n"
+            );
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&data[0..1]);
+            let _ = stream.flush();
+            continue;
+        }
+
+        let end: usize = if b.trim().is_empty() {
+            total.saturating_sub(1)
+        } else {
+            b.trim().parse().unwrap_or(total.saturating_sub(1))
+        };
+        if start >= total {
+            let _ = stream.write_all(
+                b"HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        }
+        let end = end.min(total - 1);
+        let slice = &data[start..=end];
+
+        let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let header = format!(
+            "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{total}\r\nConnection: keep-alive\r\n\r\n",
+            slice.len()
+        );
+
+        if n <= hang_chunks {
+            // 只回一半字节，随后挂起等待客户端因 read_timeout 关闭连接
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(&slice[..slice.len() / 2]);
+            let _ = stream.flush();
+            let mut discard = [0u8; 1024];
+            loop {
+                match stream.read(&mut discard) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            return; // 连接已被客户端关闭，结束本连接
+        }
+
+        let _ = stream.write_all(header.as_bytes());
+        let _ = stream.write_all(slice);
+        let _ = stream.flush();
+    }
+}
+
 #[tokio::test]
 async fn test_mid_download_read_timeout_fails_against_local_server() {
     // 200KB 默认切分为 2 块；服务器对每个分块只回一半字节便挂起，
@@ -1480,12 +1800,451 @@ async fn test_mid_download_read_timeout_fails_against_local_server() {
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
         DownloadStatus::Failed(reason) => {
             assert!(
-                reason.contains("超时"),
+                reason.to_string().contains("超时"),
                 "下载中途挂起应因读取超时失败，实际原因: {reason}"
             );
         }
         other => panic!("下载中途挂起应导致失败，实际: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_probe_timeout_auto_retry_succeeds() {
+    // 服务器对前 2 个请求（均为探测，bytes=0-0）完全不响应，触发 read_timeout；
+    // 下载器应在 max_retries=2 内自动重试，探测第 3 次成功并完成整个下载。
+    let data = test_data(TEST_DATA_LEN);
+    let (url, connections) = spawn_retry_then_succeed_server(data.clone(), 2);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(300)),
+        max_retries: 2,
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Completed => {}
+        DownloadStatus::Failed(reason) => panic!("探测重试后仍失败: {reason}"),
+        other => panic!("意外状态: {other:?}"),
+    }
+
+    // 探测重试了 2 次：总连接数 ≥ 3（2 次挂起的探测 + 后续探测/分块连接），
+    // 证明探测级自动重试确实发生
+    assert!(
+        connections.load(Ordering::SeqCst) >= 3,
+        "应发生探测重试（连接数 >= 3），实际: {}",
+        connections.load(Ordering::SeqCst)
+    );
+
+    let filename = manager
+        .get_task_filename(&task_id)
+        .await
+        .expect("应解析出最终文件名");
+    let output = std::fs::read(dir.path().join(&filename)).expect("读取下载文件失败");
+    assert_eq!(output, data, "下载内容应与服务端载荷一致");
+    assert!(
+        !dir.path().join("file.bin.temp").exists(),
+        "临时文件应被清理"
+    );
+    assert!(
+        !dir.path().join("file.bin.download_state").exists(),
+        "状态文件应被清理"
+    );
+}
+
+#[tokio::test]
+async fn test_chunk_read_timeout_auto_retry_succeeds() {
+    // 探测正常返回；首个分块请求只回一半字节便挂起触发 read_timeout，
+    // 下载器应在 max_retries 内自动重试，从已写入偏移续传（Range 头以
+    // `start + downloaded` 起始），最终字节级一致。
+    let data = test_data(TEST_DATA_LEN);
+    let (url, chunk_requests) = spawn_chunk_retry_then_succeed_server(data.clone(), 1);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(300)),
+        max_retries: 2,
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Completed => {}
+        DownloadStatus::Failed(reason) => panic!("分块重试后仍失败: {reason}"),
+        other => panic!("意外状态: {other:?}"),
+    }
+
+    // 200KB 默认 2 块；发生了一次分块超时重试，因此分块请求总数应为 3
+    // （2 块成功 + 1 次超时后的续传请求），证明分块级自动重试确实发生
+    assert!(
+        chunk_requests.load(Ordering::SeqCst) >= 3,
+        "应发生分块重试（分块请求数 >= 3），实际: {}",
+        chunk_requests.load(Ordering::SeqCst)
+    );
+
+    let filename = manager
+        .get_task_filename(&task_id)
+        .await
+        .expect("应解析出最终文件名");
+    let output = std::fs::read(dir.path().join(&filename)).expect("读取下载文件失败");
+    assert_eq!(output, data, "下载内容应与服务端载荷一致");
+    assert!(
+        !dir.path().join("file.bin.temp").exists(),
+        "临时文件应被清理"
+    );
+    assert!(
+        !dir.path().join("file.bin.download_state").exists(),
+        "状态文件应被清理"
+    );
+}
+
+/// 验证 `max_retries: 0` 时禁用自动重试：探测请求在 `read_timeout` 内超时后
+/// 立即失败，不发起任何重试（连接数恒为 1）。这是 `DownloadConfig::max_retries`
+/// 文档承诺的行为（0 表示禁用），此前无端到端覆盖。
+#[tokio::test]
+async fn test_max_retries_zero_disables_retry() {
+    // 服务器对任意请求（含探测）都挂起不响应；若重试被意外启用，连接数会 > 1
+    let (url, connections) = spawn_retry_then_succeed_server(Vec::new(), usize::MAX);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(300)),
+        max_retries: 0,
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Failed(reason) => {
+            assert!(
+                reason.to_string().contains("超时"),
+                "max_retries=0 时应因超时失败，实际原因: {reason}"
+            );
+        }
+        other => panic!("max_retries=0 时应立即失败，实际: {other:?}"),
+    }
+
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "max_retries=0 时不应重试（连接数应为 1），实际: {}",
+        connections.load(Ordering::SeqCst)
+    );
+}
+
+/// 验证自动重试仅针对瞬时（超时类）错误：永久性错误（如 HTTP 404）即使配置了
+/// `max_retries > 0` 也不会重试（连接数恒为 1），避免对无意义的错误做无谓重试。
+#[tokio::test]
+async fn test_permanent_error_not_retried() {
+    let (url, connections) = spawn_status_server_counting("404 Not Found");
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        max_retries: 3, // 显式配置重试，验证 404 仍不重试
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Failed(reason) => {
+            assert!(
+                reason.to_string().contains("404"),
+                "失败原因应包含状态码 404，实际: {reason}"
+            );
+        }
+        other => panic!("预期 Failed，实际 {other:?}"),
+    }
+
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "永久性错误不应重试（连接数应为 1），实际: {}",
+        connections.load(Ordering::SeqCst)
+    );
+}
+
+/// 验证分块处于重试退避等待期时取消能及时生效。
+///
+/// 首次尝试超时后分块进入指数退避（最长达 10s），若取消只置标志位、等分块
+/// 自然睡醒才检查，用户会感知到最长一个退避周期的延迟。此测试在退避窗口内
+/// 取消，断言最终进入 `Cancelled` 且**不再发起第 2 次重试请求**（分块请求数
+/// 恒为 1），覆盖「取消与重试交错」这一行为契约。
+#[tokio::test]
+async fn test_cancel_during_backoff_stops_retries() {
+    // 探测正常返回；所有分块首次请求都只回一半字节后挂起（触发 read_timeout
+    // 进入重试退避）。若取消不及时，第 2 次重试请求会把分块请求数推到 2。
+    // 使用 50KB（< 默认最小块 100KB）保证只有 1 个分块，便于精确计数。
+    let data = test_data(50 * 1024);
+    let (url, chunk_requests) = spawn_chunk_retry_then_succeed_server(data.clone(), usize::MAX);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(200)),
+        max_retries: 3,
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    // 等待首个分块首次尝试超时（200ms）并进入退避窗口（500ms）后取消。
+    // 即便系统调度使首次超时略晚于此刻，取消落在首次尝试期也能满足
+    // 「不再发起第 2 次请求」的断言，时序稳健。
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    manager.cancel_task(&task_id).await;
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Cancelled => {}
+        DownloadStatus::Failed(reason) => {
+            panic!("退避期间取消应得到 Cancelled，实际失败: {reason}")
+        }
+        other => panic!("退避期间取消应得到 Cancelled，实际: {other:?}"),
+    }
+
+    assert_eq!(
+        chunk_requests.load(Ordering::SeqCst),
+        1,
+        "退避期间取消后不应发起第 2 次重试（分块请求数应为 1），实际: {}",
+        chunk_requests.load(Ordering::SeqCst)
+    );
+}
+
+/// 验证「暂停发生在重试退避窗口内」时暂停立即生效并**冻结**退避计时：
+/// 暂停期间不发起下一次重试请求（分块请求数保持 1），状态置为 Paused；
+/// 恢复后按剩余退避继续计时并最终重试成功、字节级一致。
+///
+/// 若不响应暂停（旧行为：退避休眠不可中断），pause() 在退避窗口内「看似失效」——
+/// 需等满整个退避（这里 3s）重试请求才发出，期间下载仍在后台推进。断言窗口
+/// 刻意超过整个退避时长，若旧行为会把分块请求数推到 2，即可被本用例捕获。
+#[tokio::test]
+async fn test_pause_during_backoff_freezes_retry_timer() {
+    // 50KB < 默认最小块 100KB，单分块；首个分块请求挂起触发 read_timeout，
+    // 后续请求完整返回供重试成功
+    let data = test_data(50 * 1024);
+    let (url, chunk_requests) = spawn_chunk_retry_then_succeed_server(data.clone(), 1);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(200)),
+        max_retries: 3,
+        retry_base_delay: Duration::from_secs(3), // 长退避，保证暂停落在退避窗口内
+        retry_max_delay: Duration::from_secs(3),
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    // 首个分块首次尝试约 200ms 超时进入 3s 退避；此刻（400ms）暂停。
+    // 即便调度使首次超时略晚，暂停仍落在 3s 退避窗口内，时序稳健。
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    manager.pause_task(&task_id).await;
+
+    assert_eq!(
+        manager.get_task_status(&task_id).await,
+        Some(DownloadStatus::Paused),
+        "退避期间暂停后状态应为 Paused"
+    );
+
+    // 断言窗口超过整个退避时长（3s + 余量）：若退避休眠不被暂停中断，
+    // 重试会在此窗口内发出（分块请求数 -> 2）；被冻结则保持 1。
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(
+        chunk_requests.load(Ordering::SeqCst),
+        1,
+        "暂停期间不应发起重试（分块请求数应为 1），实际: {}",
+        chunk_requests.load(Ordering::SeqCst)
+    );
+
+    // 恢复后按剩余退避继续，重试成功，任务最终完成且字节级一致
+    manager.resume_task(&task_id).await;
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(30)).await {
+        DownloadStatus::Completed => {}
+        DownloadStatus::Failed(reason) => panic!("恢复后重试失败: {reason}"),
+        other => panic!("意外状态: {other:?}"),
+    }
+
+    let filename = manager
+        .get_task_filename(&task_id)
+        .await
+        .expect("应解析出最终文件名");
+    let output = std::fs::read(dir.path().join(&filename)).expect("读取下载文件失败");
+    assert_eq!(output, data, "下载内容应与服务端载荷一致");
+    assert!(
+        !dir.path().join("file.bin.temp").exists(),
+        "临时文件应被清理"
+    );
+    assert!(
+        !dir.path().join("file.bin.download_state").exists(),
+        "状态文件应被清理"
+    );
+}
+
+/// 验证「取消发生在探测请求的重试退避窗口内」时能及时生效并进入取消收尾。
+///
+/// 探测（bytes=0-0）首次请求超时后进入指数退避（最长 3s）；旧实现（`with_retry`）
+/// 的退避休眠不可被取消中断，取消后仍需等满整个退避周期再发起第 2 次探测请求，
+/// 且第 2 次仍超时后把瞬时错误一路向上抛、误报 `TaskFailed`。修复后
+/// （`probe_with_retry`）取消立即中断退避并返回 `Cancelled`，由 `start()` 进入
+/// `finish_cancelled` 取消收尾：状态置 `Cancelled`、发布 `TaskCancelled` 事件、
+/// **不再发起第 2 次探测请求**（连接数恒为 1）。
+#[tokio::test]
+async fn test_cancel_during_probe_backoff_stops_retries() {
+    // 首个连接（探测请求）挂起触发 read_timeout 进入退避；若取消不及时，第 2 次
+    // 探测请求会把连接数推到 2。后续分块阶段无需真实完成，用 usize::MAX 挂起全部连接。
+    let data = test_data(50 * 1024);
+    let (url, connections) = spawn_retry_then_succeed_server(data, usize::MAX);
+
+    let manager = DownloadManager::new();
+    // 必须在 start 前订阅事件，否则会漏掉广播
+    let mut events = manager.subscribe_events();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(200)),
+        max_retries: 3,
+        retry_base_delay: Duration::from_secs(3), // 长退避，保证取消落在退避窗口内
+        retry_max_delay: Duration::from_secs(3),
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    // 首个探测约 200ms 超时进入 3s 退避；此刻（250ms）取消。即便调度使首次超时
+    // 略晚，取消仍落在退避窗口内，时序稳健。
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    manager.cancel_task(&task_id).await;
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Cancelled => {}
+        DownloadStatus::Failed(reason) => {
+            panic!("探测退避期间取消应得到 Cancelled，实际失败: {reason}")
+        }
+        other => panic!("探测退避期间取消应得到 Cancelled，实际: {other:?}"),
+    }
+
+    // 终止事件应为 TaskCancelled（取消收尾），而非旧实现的 TaskFailed 误报
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("应在超时内收到终止事件")
+        .expect("事件通道应正常");
+    match event {
+        DownloadEvent::TaskCancelled { task_id: id } => {
+            assert_eq!(id, task_id, "取消事件应携带正确的任务 ID");
+        }
+        other => panic!("预期 TaskCancelled，实际 {other:?}"),
+    }
+
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "探测退避期间取消后不应发起第 2 次探测请求（连接数应为 1），实际: {}",
+        connections.load(Ordering::SeqCst)
+    );
+}
+
+/// 验证「暂停发生在探测请求的重试退避窗口内」时暂停立即生效并**冻结**退避计时：
+/// 暂停期间不发起下一次探测请求（连接数保持 1），状态置为 Paused；恢复后按剩余
+/// 退避继续并最终探测成功、字节级一致地完成下载。
+///
+/// 若不响应暂停（旧行为：`with_retry` 的退避休眠不可中断），pause() 在探测退避
+/// 窗口内「看似失效」——需等满整个退避（这里 3s）第 2 次探测请求才发出，期间
+/// 下载仍在后台推进。断言窗口刻意超过整个退避时长，若旧行为会把连接数推到 2，
+/// 即可被本用例捕获。
+#[tokio::test]
+async fn test_pause_during_probe_backoff_freezes_retry_timer() {
+    // 首个连接（探测请求）挂起触发 read_timeout 进入退避；之后连接正常响应，
+    // 供重试探测成功并继续完成整个下载
+    let data = test_data(50 * 1024);
+    let (url, connections) = spawn_retry_then_succeed_server(data.clone(), 1);
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+    let config = DownloadConfig {
+        read_timeout: Some(Duration::from_millis(200)),
+        max_retries: 3,
+        retry_base_delay: Duration::from_secs(3), // 长退避，保证暂停落在退避窗口内
+        retry_max_delay: Duration::from_secs(3),
+        ..Default::default()
+    };
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), config)
+        .await;
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    // 首个探测约 200ms 超时进入 3s 退避；此刻（400ms）暂停。即便调度使首次超时
+    // 略晚，暂停仍落在 3s 退避窗口内，时序稳健。
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    manager.pause_task(&task_id).await;
+
+    assert_eq!(
+        manager.get_task_status(&task_id).await,
+        Some(DownloadStatus::Paused),
+        "退避期间暂停后状态应为 Paused"
+    );
+
+    // 断言窗口超过整个退避时长（3s + 余量）：若退避休眠不被暂停中断，第 2 次
+    // 探测请求会在此窗口内发出（连接数 -> 2）；被冻结则保持 1。
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        1,
+        "暂停期间不应发起探测重试（连接数应为 1），实际: {}",
+        connections.load(Ordering::SeqCst)
+    );
+
+    // 恢复后按剩余退避继续，探测成功、分块下载完成且字节级一致
+    manager.resume_task(&task_id).await;
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(30)).await {
+        DownloadStatus::Completed => {}
+        DownloadStatus::Failed(reason) => panic!("恢复后重试失败: {reason}"),
+        other => panic!("意外状态: {other:?}"),
+    }
+
+    let filename = manager
+        .get_task_filename(&task_id)
+        .await
+        .expect("应解析出最终文件名");
+    let output = std::fs::read(dir.path().join(&filename)).expect("读取下载文件失败");
+    assert_eq!(output, data, "下载内容应与服务端载荷一致");
+    assert!(
+        !dir.path().join("file.bin.temp").exists(),
+        "临时文件应被清理"
+    );
+    assert!(
+        !dir.path().join("file.bin.download_state").exists(),
+        "状态文件应被清理"
+    );
 }
 
 #[tokio::test]
@@ -1511,7 +2270,7 @@ async fn test_connection_refused_fails_against_local_server() {
 
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
         DownloadStatus::Failed(reason) => {
-            assert!(!reason.is_empty(), "失败原因不应为空");
+            assert!(!reason.to_string().is_empty(), "失败原因不应为空");
         }
         DownloadStatus::Completed => panic!("拒绝连接的下载不应被判定为完成"),
         other => panic!("意外状态: {other:?}"),
@@ -1617,7 +2376,7 @@ async fn test_misaligned_content_range_fails_against_local_server() {
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(15)).await {
         DownloadStatus::Failed(reason) => {
             assert!(
-                reason.contains("Content-Range"),
+                reason.to_string().contains("Content-Range"),
                 "失败原因应涉及 Content-Range 校验: {reason}"
             );
         }
@@ -1724,12 +2483,12 @@ async fn test_missing_content_range_fails_against_local_server() {
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(15)).await {
         DownloadStatus::Failed(reason) => {
             assert!(
-                reason.contains("Content-Range"),
+                reason.to_string().contains("Content-Range"),
                 "失败原因应涉及 Content-Range 校验: {reason}"
             );
             // 失败原因应携带分块序号，便于在并发多分块下载中定位到具体问题分块
             assert!(
-                reason.contains("分块"),
+                reason.to_string().contains("分块"),
                 "失败原因应包含分块序号以定位问题分块: {reason}"
             );
         }
@@ -1843,7 +2602,7 @@ async fn test_fast_fail_aborts_before_spawning_remaining_chunks() {
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(15)).await {
         DownloadStatus::Failed(reason) => {
             assert!(
-                reason.contains("Content-Range"),
+                reason.to_string().contains("Content-Range"),
                 "失败原因应涉及 Content-Range 校验: {reason}"
             );
         }
@@ -2007,7 +2766,7 @@ async fn test_overdelivering_server_fails_against_local_server() {
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(15)).await {
         DownloadStatus::Failed(reason) => {
             assert!(
-                reason.contains("大小不匹配"),
+                reason.to_string().contains("大小不匹配"),
                 "失败原因应包含分块大小不匹配: {reason}"
             );
         }
@@ -2100,6 +2859,77 @@ async fn test_unknown_total_size_download_against_local_server() {
 
     let output = std::fs::read(dir.path().join("file.bin")).expect("读取下载文件失败");
     assert_eq!(output, data, "未知总大小下载内容应与服务端载荷一致");
+}
+
+#[tokio::test]
+async fn test_unknown_total_download_final_stats_report_actual_size() {
+    // 未知总大小下载（流式、无 Content-Length）在完成前 total_size 恒为 0；
+    // 完成后统计应把 total_size 更新为实际字节数，否则最终快照会显示
+    //「总大小 0 + 已下载 N」的矛盾信息。
+    let data = test_data(32 * 1024);
+    let url = spawn_unknown_total_server(data.clone());
+
+    let manager = DownloadManager::new();
+    let dir = tempfile::tempdir().unwrap();
+
+    let task_id = manager
+        .add_task(url, dir.path().to_path_buf(), DownloadConfig::default())
+        .await;
+
+    manager.start_task(&task_id).await.expect("开始下载失败");
+
+    match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
+        DownloadStatus::Completed => {}
+        other => panic!("意外状态: {other:?}"),
+    }
+
+    let stats = manager.get_task_stats(&task_id).await.expect("任务应存在");
+    assert_eq!(
+        stats.total_size,
+        data.len() as u64,
+        "未知总大小下载完成后 total_size 应为实际字节数"
+    );
+    assert_eq!(
+        stats.downloaded,
+        data.len() as u64,
+        "下载量应等于文件字节数"
+    );
+}
+
+#[tokio::test]
+async fn test_list_tasks_enumerates_managed_tasks() {
+    // 管理器应能枚举全部任务 ID（字典序、稳定顺序），这是多任务管理的入口能力
+    let manager = DownloadManager::new();
+    assert!(manager.list_tasks().await.is_empty(), "初始不应有任务");
+
+    let data = test_data(1024);
+    let dir = tempfile::tempdir().unwrap();
+
+    let id1 = manager
+        .add_task(
+            spawn_mock_server(data.clone()),
+            dir.path().to_path_buf(),
+            DownloadConfig::default(),
+        )
+        .await;
+    let id2 = manager
+        .add_task(
+            spawn_mock_server(data.clone()),
+            dir.path().to_path_buf(),
+            DownloadConfig::default(),
+        )
+        .await;
+
+    let ids = manager.list_tasks().await;
+    assert_eq!(ids.len(), 2, "应列出两个任务");
+    assert!(
+        ids.contains(&id1) && ids.contains(&id2),
+        "应包含两个任务的 ID"
+    );
+    assert!(
+        ids.windows(2).all(|w| w[0] <= w[1]),
+        "ID 列表应按字典序排序"
+    );
 }
 
 #[tokio::test]
@@ -2468,7 +3298,7 @@ async fn test_http_error_status_fails_against_local_server() {
     match wait_for_terminal(&manager, &task_id, Duration::from_secs(10)).await {
         DownloadStatus::Failed(reason) => {
             assert!(
-                reason.contains("404"),
+                reason.to_string().contains("404"),
                 "失败原因应包含状态码 404，实际: {reason}"
             );
         }
@@ -2596,7 +3426,10 @@ async fn test_subscribe_events_receives_failure() {
     match event {
         DownloadEvent::TaskFailed { task_id: id, error } => {
             assert_eq!(id, task_id, "事件应携带正确的任务 ID");
-            assert!(error.contains("404"), "失败事件应携带状态码: {error}");
+            assert!(
+                error.to_string().contains("404"),
+                "失败事件应携带状态码: {error}"
+            );
         }
         other => panic!("预期 TaskFailed，实际 {other:?}"),
     }
@@ -2667,8 +3500,11 @@ async fn test_subscribe_events_receives_mid_download_failure() {
     match event {
         DownloadEvent::TaskFailed { task_id: id, error } => {
             assert_eq!(id, task_id, "事件应携带正确的任务 ID");
-            // 截断的连接表现为 IO/读取错误，而非探测 404；这里仅断言存在非空失败原因
-            assert!(!error.is_empty(), "失败事件应携带非空原因: {error}");
+            // 截断的连接表现为 IO/读取错误，而非探测 404；这里仅断言携带了失败原因
+            assert!(
+                !error.to_string().trim().is_empty(),
+                "失败事件应携带非空原因: {error}"
+            );
         }
         other => panic!("预期 TaskFailed，实际 {other:?}"),
     }
