@@ -2166,6 +2166,12 @@ impl DownloadManager {
         }
     }
 
+    /// 获取任务的下载源 URL
+    pub async fn get_task_url(&self, task_id: &str) -> Option<String> {
+        let task = self.tasks.lock().await.get(task_id).cloned();
+        task.map(|task| task.url.clone())
+    }
+
     /// 订阅任务进度：返回最新统计快照的 watch 接收端（任务不存在时返回 `None`）
     pub async fn subscribe_progress(
         &self,
@@ -2474,7 +2480,9 @@ fn join_continuation_segments(params: &BTreeMap<String, String>, base: &str) -> 
     Some(joined)
 }
 
-fn extract_filename_from_url(url: &str) -> Option<String> {
+/// 从 URL 末段提取文件名（解码 URL 编码后返回，失败时返回 `None`）。
+/// 供外部（如托盘展示未解析文件名的任务）在响应头解析完成前显示可读名称。
+pub fn extract_filename_from_url(url: &str) -> Option<String> {
     // 尝试从URL路径中提取文件名
     let parsed_url = url::Url::parse(url).ok()?;
     let path = parsed_url.path();
