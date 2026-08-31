@@ -7,12 +7,16 @@
 //! ## 核心类型
 //!
 //! - [`DownloadManager`]：任务管理器，负责添加/启动/暂停/恢复/取消/移除任务，
-//!   并提供全局事件总线（[`DownloadEvent`]）与任务枚举（[`DownloadManager::list_tasks`]）。
+//!   并提供全局事件总线（[`DownloadEvent`]）、全局进度流
+//!   （[`DownloadManager::subscribe_all_progress`]）与任务枚举
+//!   （[`DownloadManager::list_tasks`] / [`DownloadManager::list_task_overviews`]）。
 //! - [`DownloadTask`]：单个下载任务的共享句柄，提供进度快照（[`DownloadTask::get_stats`]）、
 //!   实时进度订阅（[`DownloadTask::subscribe_progress`]）与 pause/resume/cancel 控制。
 //! - [`DownloadConfig`]：下载配置（连接数、块大小、速度限制、超时、自动重试等）。
 //! - [`DownloadStatus`] / [`DownloadError`]：结构化任务状态与错误，
 //!   可程序化匹配 `RequestTimeout`/`ReadTimeout` 等瞬时错误并自动重试。
+//! - [`TaskOverview`]：任务概览快照（状态 + 统计 + 配置聚合），配合
+//!   [`DownloadManager::list_task_overviews`] 供监控面板一次拉取全量任务列表。
 //!
 //! ## 快速开始
 //!
@@ -62,7 +66,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use log::{error, info, warn};
 use parking_lot::RwLock;
@@ -247,8 +251,17 @@ pub struct ChunkInfo {
 }
 
 /// 下载统计信息
+///
+/// 供进度订阅者与监控面板消费，包含任务身份（`task_id`）、生命周期时间戳
+/// （`created_at`/`started_at`/`finished_at`）与分块摘要（`unfinished_chunks`/
+/// `completed_chunks`）。快照通过 [`DownloadTask::subscribe_progress`] 或
+/// [`DownloadManager::subscribe_all_progress`] 获取；时间戳与分块摘要字段在
+/// 内部发布点与 `chunks` 保持一致。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DownloadStats {
+    /// 所属任务 ID（UUID 字符串，与 `add_task` 返回值一致）。用于多任务
+    /// 订阅场景（如全局进度流）区分快照来源。
+    pub task_id: String,
     /// 总大小（字节）。`0` 表示大小未知或空文件——两者无法仅凭该字段区分，
     /// 可结合 `downloaded` 与任务状态判断。
     pub total_size: u64,
@@ -262,6 +275,16 @@ pub struct DownloadStats {
     pub remaining: Duration,
     /// 各分块的进度
     pub chunks: Vec<ChunkInfo>,
+    /// 任务创建时间（`new`/`add_task` 时生成）
+    pub created_at: SystemTime,
+    /// 首次开始下载的时间；尚未开始（`Pending`）时为 `None`
+    pub started_at: Option<SystemTime>,
+    /// 进入终态（完成/失败/取消）的时间；仍非终态时为 `None`
+    pub finished_at: Option<SystemTime>,
+    /// 未完成的分块数（含进行中与未开始），等于 `chunks.len() - completed_chunks`
+    pub unfinished_chunks: usize,
+    /// 已完成的分块数（`chunks.iter().filter(|c| c.completed).count()`）
+    pub completed_chunks: usize,
 }
 
 /// 下载配置
@@ -328,12 +351,37 @@ impl Default for DownloadConfig {
 /// 被识别并丢弃（重新下载），避免用不兼容的旧数据错位写入临时文件。
 const STATE_VERSION: u32 = 1;
 
-/// 进度通知的最小发布间隔。
+/// 进度通知的最小发布比例。
 ///
 /// 分块下载循环在写入每个网络块后都会更新统计；若逐块发布，会为大量小块反复
-/// 深拷贝整个 `chunks` 快照（大文件时开销显著）。这里按时间节流，保证订阅者仍能
-/// 以足够的频率（约 10 次/秒）感知进度，同时避免无谓的克隆开销。
-const PROGRESS_PUBLISH_INTERVAL: Duration = Duration::from_millis(100);
+/// 深拷贝整个 `chunks` 快照（大文件时开销显著）。这里按比例节流：累计新增下载量
+/// 每达到「文件总大小 × 该比例」才发布一次，让订阅者以稳定的进度百分比粒度感知
+/// 进度，同时避免无谓的克隆开销。
+const PROGRESS_PUBLISH_RATIO: f64 = 0.01; // 1%
+
+/// 计算进度通知的发布步长（字节）。
+///
+/// 按文件总大小的固定比例计算，使发布次数与文件大小解耦（约 1/比例 次）；
+/// 总大小未知（`total_size == 0`）时无法按比例切分，退化为固定字节步长。
+fn progress_publish_step(total_size: u64) -> u64 {
+    const FALLBACK_STEP: u64 = 1024 * 1024; // 1MB
+    if total_size == 0 {
+        return FALLBACK_STEP;
+    }
+    ((total_size as f64 * PROGRESS_PUBLISH_RATIO) as u64).max(1)
+}
+
+/// 根据 `chunks` 刷新 [`DownloadStats`] 中的派生摘要字段（`unfinished_chunks` /
+/// `completed_chunks`），使其与分块列表保持一致。
+///
+/// 摘要字段是监控面板高频读取的轻量聚合，不应让面板逐块解析 `chunks`。这里在
+/// 每次发布快照前统一刷新（发布已按进度步长节流，O(n) 遍历成本可忽略），避免
+/// 在下载热路径的每个网络块上做同样计算。
+fn refresh_chunk_summary(stats: &mut DownloadStats) {
+    let completed = stats.chunks.iter().filter(|c| c.completed).count();
+    stats.completed_chunks = completed;
+    stats.unfinished_chunks = stats.chunks.len().saturating_sub(completed);
+}
 
 /// 根据文件大小计算状态保存间隔（自适应策略）。
 ///
@@ -435,14 +483,33 @@ pub struct DownloadState {
     pub chunks: Vec<ChunkInfo>,
 }
 
-/// 下载事件：任务终止时的离散通知（完成/失败/取消）。
+/// 下载事件：任务生命周期中的离散通知。
 ///
-/// 与 [`DownloadManager::subscribe_progress`] 提供的周期统计快照互补：后者用于
-/// 观察下载进度，本事件流用于让订阅者**无需轮询状态**即可即时感知任务结束及其
-/// 失败原因。终止事件是「通知」而非权威状态——真实状态仍以
+/// 事件覆盖两类信息：**生命周期切换**（`TaskStarted`/`TaskPaused`/`TaskResumed`）与
+/// **终止结果**（`TaskCompleted`/`TaskFailed`/`TaskCancelled`）。与
+/// [`DownloadManager::subscribe_progress`] 提供的周期统计快照互补：后者用于观察下载
+/// 进度，本事件流用于让订阅者**无需轮询状态**即可即时感知任务开始/暂停/恢复/结束及其
+/// 失败原因。事件是「通知」而非权威状态——真实状态仍以
 /// [`DownloadManager::get_task_status`] 为准（例如订阅过慢导致事件被广播丢弃时）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 可序列化（serde），便于监控面板经 JSON 等格式跨进程传递事件流。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownloadEvent {
+    /// 任务开始下载（`start` 成功置为 `Downloading` 后发布）
+    TaskStarted {
+        /// 任务 ID（与 `add_task` 返回值一致）
+        task_id: String,
+    },
+    /// 任务暂停
+    TaskPaused {
+        /// 任务 ID
+        task_id: String,
+    },
+    /// 任务恢复下载
+    TaskResumed {
+        /// 任务 ID
+        task_id: String,
+    },
     /// 任务下载完成
     TaskCompleted {
         /// 任务 ID（与 `add_task` 返回值一致）
@@ -514,8 +581,8 @@ pub struct DownloadTask {
     state_lock: Arc<tokio::sync::Mutex<()>>,
     /// 进度通知源（watch 通道，订阅者获取最新统计快照）
     progress_tx: watch::Sender<DownloadStats>,
-    /// 上一次发布进度通知的时间（用于按时间节流发布）
-    last_progress: Arc<parking_lot::Mutex<Instant>>,
+    /// 上一次发布进度通知时的已下载字节数（用于按进度步长节流发布）
+    last_progress: Arc<parking_lot::Mutex<u64>>,
     /// 全局事件发送端（终止时发布完成/失败/取消事件）。独立创建的任务默认指向
     /// 一个无订阅者的通道（事件静默丢弃）；由 `DownloadManager::add_task` 注入
     /// 管理器共享的事件总线，使 `subscribe_events` 能收到该任务的事件。
@@ -532,18 +599,26 @@ pub struct DownloadTask {
 impl DownloadTask {
     /// 创建新的下载任务
     pub fn new(url: String, download_dir: PathBuf, config: DownloadConfig) -> Self {
+        let id = Uuid::new_v4();
+        let now = SystemTime::now();
         let initial_stats = DownloadStats {
+            task_id: id.to_string(),
             total_size: 0,
             downloaded: 0,
             speed: 0.0,
             elapsed: Duration::default(),
             remaining: Duration::default(),
             chunks: Vec::new(),
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            unfinished_chunks: 0,
+            completed_chunks: 0,
         };
         let (progress_tx, _) = watch::channel(initial_stats.clone());
 
         Self {
-            id: Uuid::new_v4(),
+            id,
             url,
             download_dir,
             filename: Arc::new(Mutex::new(None)),
@@ -560,7 +635,7 @@ impl DownloadTask {
             speed_tracker: Arc::new(parking_lot::Mutex::new(SpeedTracker::new())),
             state_lock: Arc::new(tokio::sync::Mutex::new(())),
             progress_tx,
-            last_progress: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            last_progress: Arc::new(parking_lot::Mutex::new(0)),
             // 独立创建的任务默认无事件订阅者；`.0` 取 sender、接收端立即丢弃，
             // 此时 send 只会返回 Err 而无副作用。真正的共享总线由 add_task 注入。
             event_tx: broadcast::channel(1).0,
@@ -593,6 +668,19 @@ impl DownloadTask {
         }
 
         *self.started_at.lock() = Some(Instant::now());
+        // 记录「首次开始下载」的墙钟时间（重启/取消后再 start 时保持首次值不变），
+        // 供监控面板展示生命周期
+        {
+            let mut stats = self.stats.lock().await;
+            if stats.started_at.is_none() {
+                stats.started_at = Some(SystemTime::now());
+            }
+        }
+        // 发布生命周期事件：任务进入下载中。独立创建的任务无订阅者时静默丢弃；
+        // 由 DownloadManager::add_task 注入共享总线后，subscribe_events 可收到。
+        let _ = self.event_tx.send(DownloadEvent::TaskStarted {
+            task_id: self.id.to_string(),
+        });
 
         let task = self.clone();
         tokio::spawn(async move {
@@ -713,8 +801,15 @@ impl DownloadTask {
                 stats.elapsed = Duration::default();
                 stats.remaining = Duration::default();
                 stats.chunks = task.create_chunks(total_size, supports_range);
+                // 重启（取消后再 start）时清除上一轮的终态时间戳
+                stats.finished_at = None;
+                refresh_chunk_summary(&mut stats);
                 // 重置测速基线，避免复用旧任务累计字节导致进度/速度错乱或下溢
                 task.speed_tracker.lock().reset(0);
+                // 重置进度发布基准：last_progress 记录上次发布时的字节数，若不重置
+                // 会保留取消前/上一轮的旧值，重启后 saturating_sub 恒为 0，进度通知
+                // 会被抑制到重新下载超过旧值为止（大文件长时间无进度更新）
+                *task.last_progress.lock() = 0;
                 // 通知进度订阅者初始化后的快照（含 total_size 与分块信息）
                 task.progress_tx.send_replace(stats.clone());
             }
@@ -794,10 +889,13 @@ impl DownloadTask {
             // 过期快照（downloaded == total_size）会发布到进度通道，覆盖新下载刚
             // 发布的初始快照，订阅者会误判「新下载已完成」而提前退出。
             {
-                let stats = task.stats.lock().await;
+                let mut stats = task.stats.lock().await;
                 if task.start_epoch.load(Ordering::Acquire) != epoch {
                     return;
                 }
+                // 记录进入终态的时间（供监控面板展示生命周期）
+                stats.finished_at = Some(SystemTime::now());
+                refresh_chunk_summary(&mut stats);
                 task.progress_tx.send_replace(stats.clone());
             }
         });
@@ -827,10 +925,13 @@ impl DownloadTask {
         // 会把失败归咎于健康的新下载）。复查之后到函数结束再无 await，事件发送
         // 与快照发布构成一个不可分割的原子段。
         {
-            let stats = self.stats.lock().await;
+            let mut stats = self.stats.lock().await;
             if self.start_epoch.load(Ordering::Acquire) != epoch {
                 return;
             }
+            // 记录进入终态的时间
+            stats.finished_at = Some(SystemTime::now());
+            refresh_chunk_summary(&mut stats);
             self.progress_tx.send_replace(stats.clone());
         }
         // 同步发布失败事件（错误信息与 DownloadStatus::Failed 保持一致）
@@ -869,10 +970,13 @@ impl DownloadTask {
         // 在持有 stats 锁时复查世代并同步发布（与 fail_and_notify 一致），避免
         // 「复查 epoch → 获取 stats 锁」之间被新的 start() 抢占。
         {
-            let stats = self.stats.lock().await;
+            let mut stats = self.stats.lock().await;
             if self.start_epoch.load(Ordering::Acquire) != epoch {
                 return;
             }
+            // 记录进入终态的时间
+            stats.finished_at = Some(SystemTime::now());
+            refresh_chunk_summary(&mut stats);
             self.progress_tx.send_replace(stats.clone());
         }
     }
@@ -981,6 +1085,9 @@ impl DownloadTask {
         // 重置速度/剩余时间，避免恢复后短暂显示暂停前的旧值（与全新初始化保持一致）
         stats.speed = 0.0;
         stats.remaining = Duration::default();
+        // 取消后重启走恢复路径时，清除上一轮的终态时间戳
+        stats.finished_at = None;
+        refresh_chunk_summary(&mut stats);
         // 重置测速基线，避免把恢复前的历史字节计入首次速度
         self.speed_tracker.lock().reset(downloaded);
         // 通知进度订阅者恢复后的快照
@@ -1549,19 +1656,22 @@ impl DownloadTask {
                 );
             }
 
-            // 节流发布进度通知：仅在超过最小间隔时才深拷贝快照并发布，
+            // 节流发布进度通知：仅在累计新增下载量达到一个比例步长时才深拷贝快照并发布，
             // 避免每个网络块都克隆整个 chunks 列表（大文件下有显著开销）
+            let publish_step = progress_publish_step(stats.total_size);
             let should_publish = {
                 let mut last = self.last_progress.lock();
-                let now = Instant::now();
-                if now.duration_since(*last) >= PROGRESS_PUBLISH_INTERVAL {
-                    *last = now;
+                if stats.downloaded.saturating_sub(*last) >= publish_step {
+                    *last = stats.downloaded;
                     true
                 } else {
                     false
                 }
             };
             if should_publish {
+                // 发布前同步派生摘要字段（completed_chunks 依赖 chunks 的 completed 状态，
+                // 该状态在 download_chunk 内更新，本循环不直接改，故只在发布时刷新一次）
+                refresh_chunk_summary(&mut stats);
                 self.progress_tx.send_replace(stats.clone());
             }
 
@@ -1760,6 +1870,10 @@ impl DownloadTask {
             self.pause_notify.notify_waiters(); // 唤醒所有等待中的分块
             *status = DownloadStatus::Paused;
         }
+        // 发布生命周期事件（状态已在锁内置为 Paused）
+        let _ = self.event_tx.send(DownloadEvent::TaskPaused {
+            task_id: self.id.to_string(),
+        });
 
         // 保存暂停状态
         if let Err(e) = self.save_state().await {
@@ -1779,6 +1893,10 @@ impl DownloadTask {
             self.pause_notify.notify_waiters(); // 唤醒所有等待中的分块
             *status = DownloadStatus::Downloading;
         }
+        // 发布生命周期事件（状态已在锁内置为 Downloading）
+        let _ = self.event_tx.send(DownloadEvent::TaskResumed {
+            task_id: self.id.to_string(),
+        });
 
         // 复位测速/剩余时间基线：暂停期间没有数据流动，但其墙钟时长仍会计入
         // 测速滑动窗口，导致恢复后首个窗口把速度算成近 0、剩余时间被严重高估。
@@ -1831,7 +1949,11 @@ impl DownloadTask {
 
     /// 获取下载统计
     pub async fn get_stats(&self) -> DownloadStats {
-        self.stats.lock().await.clone()
+        let mut stats = self.stats.lock().await;
+        // 摘要字段（active/completed_chunks）在发布点与 get_stats 调用处保持一致，
+        // 避免调用方在两次发布之间读到滞后的摘要
+        refresh_chunk_summary(&mut stats);
+        stats.clone()
     }
 
     /// 获取当前配置快照
@@ -1854,8 +1976,8 @@ impl DownloadTask {
 
     /// 订阅下载进度：返回最新统计快照的 watch 接收端
     ///
-    /// 订阅者会立即收到当前快照，并在下载推进时收到新快照（约每 100ms 节流发布）。
-    /// 可用于替代主动轮询 [`DownloadTask::get_stats`]。
+    /// 订阅者会立即收到当前快照，并在下载推进时收到新快照（按文件大小的固定比例
+    /// 节流发布，约每 1% 一档）。可用于替代主动轮询 [`DownloadTask::get_stats`]。
     pub fn subscribe_progress(&self) -> watch::Receiver<DownloadStats> {
         self.progress_tx.subscribe()
     }
@@ -2073,9 +2195,30 @@ impl SpeedTracker {
     }
 }
 
+/// 任务概览：监控面板「列表」场景的一次性查询快照。
+///
+/// 聚合任务的公开身份（ID/URL/文件名）、状态、统计与配置，供
+/// [`DownloadManager::list_task_overviews`] 批量返回，避免面板为每个任务分别
+/// 调用 `get_task_status`/`get_task_stats` 等多次查询。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskOverview {
+    /// 任务 ID（与 `add_task` 返回值一致）
+    pub task_id: String,
+    /// 下载源 URL
+    pub url: String,
+    /// 任务最终文件名（尚未解析时为 `None`）
+    pub filename: Option<String>,
+    /// 任务状态
+    pub status: DownloadStatus,
+    /// 任务统计快照（含进度、时间戳与分块摘要）
+    pub stats: DownloadStats,
+    /// 任务当前配置
+    pub config: DownloadConfig,
+}
+
 /// 下载管理器
 ///
-/// 内部状态（任务表与事件总线）均为共享句柄，`Clone` 是廉价的手柄复制：
+/// 内部状态（任务表与事件/进度总线）均为共享句柄，`Clone` 是廉价的手柄复制：
 /// 克隆出的多个 `DownloadManager` 共享同一份任务与事件流，可用于把管理器
 /// 交给多个 `tokio::spawn` 的任务分别驱动下载与监听事件（无需再包 `Arc`）。
 #[derive(Clone)]
@@ -2084,23 +2227,51 @@ pub struct DownloadManager {
     /// 全局事件总线（广播通道）：所有任务终止时发布完成/失败/取消事件，
     /// 由 `subscribe_events` 提供给订阅者。
     event_tx: broadcast::Sender<DownloadEvent>,
+    /// 全局进度总线（watch 通道）：保存「最近一个更新过进度的任务」的快照，
+    /// 由各任务的进度订阅转发而来，供 `subscribe_all_progress` 提供给订阅者。
+    progress_tx: watch::Sender<DownloadStats>,
 }
 
 impl DownloadManager {
     /// 创建新的下载管理器
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(256);
+        let initial = DownloadStats {
+            task_id: String::new(),
+            total_size: 0,
+            downloaded: 0,
+            speed: 0.0,
+            elapsed: Duration::default(),
+            remaining: Duration::default(),
+            chunks: Vec::new(),
+            created_at: SystemTime::now(),
+            started_at: None,
+            finished_at: None,
+            unfinished_chunks: 0,
+            completed_chunks: 0,
+        };
+        let (progress_tx, _) = watch::channel(initial);
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            progress_tx,
         }
     }
 
-    /// 订阅全局下载事件：返回广播接收端，实时收到所有任务的终止事件
-    /// （完成/失败/取消）。事件是「通知」而非权威状态，订阅过慢可能因广播
-    /// 丢弃而漏掉事件，此时应以 `get_task_status` 为准。
+    /// 订阅全局下载事件：返回广播接收端，实时收到所有任务的生命周期事件
+    /// （开始/暂停/恢复/完成/失败/取消，见 [`DownloadEvent`]）。事件是「通知」而非
+    /// 权威状态，订阅过慢可能因广播丢弃而漏掉事件，此时应以 `get_task_status` 为准。
     pub fn subscribe_events(&self) -> broadcast::Receiver<DownloadEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// 订阅全局下载进度：返回 watch 接收端，实时收到**任一任务**的最新进度快照。
+    ///
+    /// 快照携带 `task_id`，订阅者据此区分来源（`task_id` 为空表示初始占位快照）。
+    /// 该流适合「活动面板」实时刷新场景；需要完整任务列表时配合
+    /// [`DownloadManager::list_task_overviews`] 使用。
+    pub fn subscribe_all_progress(&self) -> watch::Receiver<DownloadStats> {
+        self.progress_tx.subscribe()
     }
 
     /// 列出当前管理器中所有任务的 ID（按字典序排序，保证遍历顺序稳定）。
@@ -2109,6 +2280,27 @@ impl DownloadManager {
         let mut ids: Vec<String> = self.tasks.lock().await.keys().cloned().collect();
         ids.sort();
         ids
+    }
+
+    /// 批量查询所有任务的概览快照（按任务 ID 字典序排序）。
+    ///
+    /// 聚合每个任务的 ID/URL/文件名/状态/统计/配置为 [`TaskOverview`]，供监控面板
+    /// 「列表」场景一次取全量数据，避免逐个任务的多次异步查询。
+    pub async fn list_task_overviews(&self) -> Vec<TaskOverview> {
+        let mut tasks: Vec<Arc<DownloadTask>> = self.tasks.lock().await.values().cloned().collect();
+        tasks.sort_by_key(|t| t.id);
+        let mut out = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            out.push(TaskOverview {
+                task_id: task.id.to_string(),
+                url: task.url.clone(),
+                filename: task.filename().await,
+                status: task.get_status().await,
+                stats: task.get_stats().await,
+                config: task.get_config(),
+            });
+        }
+        out
     }
 
     /// 添加下载任务
@@ -2122,6 +2314,20 @@ impl DownloadManager {
         let mut task = DownloadTask::new(url, download_dir, config);
         task.event_tx = self.event_tx.clone();
         let task = Arc::new(task);
+
+        // 启动全局进度转发：把该任务的进度快照同步到管理器的全局进度通道，
+        // 使 subscribe_all_progress 能收到它。转发任务持有着 watch 接收端；当任务
+        // 从管理器移除（Arc 释放、进度发送端随之丢弃）时，changed() 返回 Err 而退出。
+        let mut task_progress = task.subscribe_progress();
+        let global_progress_tx = self.progress_tx.clone();
+        // 立即转发一次当前快照，使全局通道尽快反映新任务，无需等待首次进度变化
+        let _ = global_progress_tx.send(task_progress.borrow().clone());
+        // 转发循环：任务被移除/释放、进度发送端关闭时 changed() 返回 Err，循环随之结束
+        tokio::spawn(async move {
+            while let Ok(()) = task_progress.changed().await {
+                let _ = global_progress_tx.send(task_progress.borrow().clone());
+            }
+        });
 
         let task_id = task.id.to_string();
         self.tasks.lock().await.insert(task_id.clone(), task);
@@ -2208,6 +2414,60 @@ impl DownloadManager {
         if let Some(task) = task {
             task.cancel().await;
         }
+    }
+
+    /// 批量暂停任务。
+    ///
+    /// 逐个调用 [`DownloadTask::pause`]（已非下载中的任务静默跳过）。返回实际
+    /// 暂停的任务数（任务不存在的 ID 不计入）。
+    pub async fn pause_tasks(&self, task_ids: &[String]) -> usize {
+        let targets = self.collect_tasks(task_ids).await;
+        let count = targets.len();
+        for task in targets {
+            task.pause().await;
+        }
+        count
+    }
+
+    /// 批量恢复任务。
+    ///
+    /// 逐个调用 [`DownloadTask::resume`]（已非暂停中的任务静默跳过）。返回实际
+    /// 恢复的任务数（任务不存在的 ID 不计入）。
+    pub async fn resume_tasks(&self, task_ids: &[String]) -> usize {
+        let targets = self.collect_tasks(task_ids).await;
+        let count = targets.len();
+        for task in targets {
+            task.resume().await;
+        }
+        count
+    }
+
+    /// 批量取消任务。
+    ///
+    /// 逐个调用 [`DownloadTask::cancel`]（已处于终态的任务静默跳过）。返回实际
+    /// 取消的任务数（任务不存在的 ID 不计入）。
+    pub async fn cancel_tasks(&self, task_ids: &[String]) -> usize {
+        let targets = self.collect_tasks(task_ids).await;
+        let count = targets.len();
+        for task in targets {
+            task.cancel().await;
+        }
+        count
+    }
+
+    /// 按 ID 集合取出存在的任务句柄（保持入参顺序，去除不存在/重复的 ID）。
+    ///
+    /// 批量操作共享该辅助：先在任务表锁内一次收集所有句柄并释放锁，再逐个执行
+    /// 耗时操作，避免跨 await 长时间占用任务表锁阻塞其它管理操作。
+    async fn collect_tasks(&self, task_ids: &[String]) -> Vec<Arc<DownloadTask>> {
+        let tasks = self.tasks.lock().await;
+        let mut out = Vec::with_capacity(task_ids.len());
+        for id in task_ids {
+            if let Some(task) = tasks.get(id).cloned() {
+                out.push(task);
+            }
+        }
+        out
     }
 
     /// 移除任务并释放相关资源
