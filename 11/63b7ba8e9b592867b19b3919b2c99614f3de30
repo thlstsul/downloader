@@ -1,0 +1,33 @@
+src/lib.rs
+  s_f295c90ae57188::t_0e5680f070fb22 2325-2328
+  s_f295c90ae57188::t_1947e62830f170 2322-2324
+  s_f295c90ae57188::t_66681df5ec7a95 2329-2331
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.2",
+  "base_commit_sha": "1163b7ba8e9b592867b19b3919b2c99614f3de30",
+  "prompts": {},
+  "sessions": {
+    "s_f295c90ae57188": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a95234702cdab631bb1046c",
+        "model": "volc/deepseek-v4-flash-0731"
+      },
+      "human_author": "THLSTSUL <1095533751@qq.com>",
+      "custom_attributes": {
+        "client_type": "ide",
+        "runtime_client": "trae-tob-git-ai",
+        "tool_name": "SearchReplace",
+        "source_scene": "agent",
+        "operation_id": "6a95355102cdab631bb107ad",
+        "tool_use_id": "6a95355102cdab631bb107ad",
+        "display_model_name": "volc/deepseek-v4-flash-0731",
+        "edit_kind": "file_edit",
+        "session_id": "6a95234702cdab631bb1046c",
+        "external_session_id": "6a95234702cdab631bb1046c"
+      }
+    }
+  }
+}
