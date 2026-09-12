@@ -1299,7 +1299,7 @@ async fn test_remove_task_cancels_paused_download() {
 #[tokio::test]
 async fn test_remove_task_racing_finalization_preserves_file() {
     // 1MB + 512KB/s 限速：约 2s 下载时长，且最后一个分块的写入与上一次进度发布
-    // 间隔 ≥ PROGRESS_PUBLISH_INTERVAL，保证「写满快照」真实存在、可被观察到
+    // 间隔 ≥ PROGRESS_PUBLISH_TICK，保证「写满快照」真实存在、可被观察到
     let data = test_data(1024 * 1024);
     let url = spawn_mock_server(data.clone());
 

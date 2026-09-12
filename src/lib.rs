@@ -351,31 +351,21 @@ impl Default for DownloadConfig {
 /// 被识别并丢弃（重新下载），避免用不兼容的旧数据错位写入临时文件。
 const STATE_VERSION: u32 = 1;
 
-/// 进度通知的最小发布比例。
+/// 进度通知的固定发布节拍。
 ///
-/// 分块下载循环在写入每个网络块后都会更新统计；若逐块发布，会为大量小块反复
-/// 深拷贝整个 `chunks` 快照（大文件时开销显著）。这里按比例节流：累计新增下载量
-/// 每达到「文件总大小 × 该比例」才发布一次，让订阅者以稳定的进度百分比粒度感知
-/// 进度，同时避免无谓的克隆开销。
-const PROGRESS_PUBLISH_RATIO: f64 = 0.01; // 1%
-
-/// 计算进度通知的发布步长（字节）。
+/// 进度本质是时间维度的展示数据：按固定时间片发布使通知密度与网速彻底解耦——
+/// 低网速下不再出现数分钟无通知的静默期，高网速下频率也不随字节量放大。
 ///
-/// 按文件总大小的固定比例计算，使发布次数与文件大小解耦（约 1/比例 次）；
-/// 总大小未知（`total_size == 0`）时无法按比例切分，退化为固定字节步长。
-fn progress_publish_step(total_size: u64) -> u64 {
-    const FALLBACK_STEP: u64 = 1024 * 1024; // 1MB
-    if total_size == 0 {
-        return FALLBACK_STEP;
-    }
-    ((total_size as f64 * PROGRESS_PUBLISH_RATIO) as u64).max(1)
-}
+/// 该节拍同时是发布侧深拷贝的频率上限：发布点把本地 `stats`（含整个 `chunks`
+/// 列表）深拷贝进新 `Arc`，若无节拍，大文件下每个网络块都会付出这次拷贝。`Arc`
+/// 包装优化的是订阅端与全局转发侧的克隆（均为引用计数递增），而非发布侧。
+const PROGRESS_PUBLISH_TICK: Duration = Duration::from_millis(250);
 
 /// 根据 `chunks` 刷新 [`DownloadStats`] 中的派生摘要字段（`unfinished_chunks` /
 /// `completed_chunks`），使其与分块列表保持一致。
 ///
 /// 摘要字段是监控面板高频读取的轻量聚合，不应让面板逐块解析 `chunks`。这里在
-/// 每次发布快照前统一刷新（发布已按进度步长节流，O(n) 遍历成本可忽略），避免
+/// 每次发布快照前统一刷新（发布已按固定时间片节流，O(n) 遍历成本可忽略），避免
 /// 在下载热路径的每个网络块上做同样计算。
 fn refresh_chunk_summary(stats: &mut DownloadStats) {
     let completed = stats.chunks.iter().filter(|c| c.completed).count();
@@ -579,10 +569,11 @@ pub struct DownloadTask {
     speed_tracker: Arc<parking_lot::Mutex<SpeedTracker>>,
     /// 状态文件写入锁：串行化并发 save_state，避免多个分块同时写坏状态文件
     state_lock: Arc<tokio::sync::Mutex<()>>,
-    /// 进度通知源（watch 通道，订阅者获取最新统计快照）
-    progress_tx: watch::Sender<DownloadStats>,
-    /// 上一次发布进度通知时的已下载字节数（用于按进度步长节流发布）
-    last_progress: Arc<parking_lot::Mutex<u64>>,
+    /// 进度通知源（watch 通道，订阅者获取最新统计快照；快照以 `Arc` 包装，
+    /// 发布与订阅端的克隆均为廉价的引用计数递增）
+    progress_tx: watch::Sender<Arc<DownloadStats>>,
+    /// 上一次发布进度通知的时间（用于按固定时间片节流发布）
+    last_publish_at: Arc<parking_lot::Mutex<Instant>>,
     /// 全局事件发送端（终止时发布完成/失败/取消事件）。独立创建的任务默认指向
     /// 一个无订阅者的通道（事件静默丢弃）；由 `DownloadManager::add_task` 注入
     /// 管理器共享的事件总线，使 `subscribe_events` 能收到该任务的事件。
@@ -615,7 +606,7 @@ impl DownloadTask {
             unfinished_chunks: 0,
             completed_chunks: 0,
         };
-        let (progress_tx, _) = watch::channel(initial_stats.clone());
+        let (progress_tx, _) = watch::channel(Arc::new(initial_stats.clone()));
 
         Self {
             id,
@@ -635,7 +626,7 @@ impl DownloadTask {
             speed_tracker: Arc::new(parking_lot::Mutex::new(SpeedTracker::new())),
             state_lock: Arc::new(tokio::sync::Mutex::new(())),
             progress_tx,
-            last_progress: Arc::new(parking_lot::Mutex::new(0)),
+            last_publish_at: Arc::new(parking_lot::Mutex::new(Instant::now())),
             // 独立创建的任务默认无事件订阅者；`.0` 取 sender、接收端立即丢弃，
             // 此时 send 只会返回 Err 而无副作用。真正的共享总线由 add_task 注入。
             event_tx: broadcast::channel(1).0,
@@ -806,12 +797,10 @@ impl DownloadTask {
                 refresh_chunk_summary(&mut stats);
                 // 重置测速基线，避免复用旧任务累计字节导致进度/速度错乱或下溢
                 task.speed_tracker.lock().reset(0);
-                // 重置进度发布基准：last_progress 记录上次发布时的字节数，若不重置
-                // 会保留取消前/上一轮的旧值，重启后 saturating_sub 恒为 0，进度通知
-                // 会被抑制到重新下载超过旧值为止（大文件长时间无进度更新）
-                *task.last_progress.lock() = 0;
+                // 重置发布时间基准，避免沿用取消前的时间戳导致恢复后立即发布
+                *task.last_publish_at.lock() = Instant::now();
                 // 通知进度订阅者初始化后的快照（含 total_size 与分块信息）
-                task.progress_tx.send_replace(stats.clone());
+                task.progress_tx.send_replace(Arc::new(stats.clone()));
             }
 
             // 执行下载
@@ -884,23 +873,30 @@ impl DownloadTask {
             // 发布最终统计快照，确保订阅者在完成/失败/取消时收到终止信号
             // （空文件等无数据写入的场景不会触发逐块发布）。
             //
-            // 原子性：在持有 stats 锁时复查世代并同步发布（send_replace 无 await），
-            // 避免「复查 epoch → 获取 stats 锁」之间被新的 start() 抢占——否则本代
-            // 过期快照（downloaded == total_size）会发布到进度通道，覆盖新下载刚
-            // 发布的初始快照，订阅者会误判「新下载已完成」而提前退出。
-            {
-                let mut stats = task.stats.lock().await;
-                if task.start_epoch.load(Ordering::Acquire) != epoch {
-                    return;
-                }
-                // 记录进入终态的时间（供监控面板展示生命周期）
-                stats.finished_at = Some(SystemTime::now());
-                refresh_chunk_summary(&mut stats);
-                task.progress_tx.send_replace(stats.clone());
-            }
+            // 原子性：辅助方法在持有 stats 锁时复查世代并同步发布（send_replace 无
+            // await），避免「复查 epoch → 获取 stats 锁」之间被新的 start() 抢占——
+            // 否则本代过期快照（downloaded == total_size）会发布到进度通道，覆盖新
+            // 下载刚发布的初始快照，订阅者会误判「新下载已完成」而提前退出。
+            task.publish_final_snapshot_if_current(epoch).await;
         });
 
         Ok(())
+    }
+
+    /// 在持有 stats 锁时复查世代并发布终态快照：记录进入终态时间、刷新分块摘要
+    /// 后发布（send_replace 无 await）。世代不匹配（期间发生新的 `start()`）时
+    /// 跳过并返回 `false`——过期世代不得为新一代任务发布误导性快照。各调用方在
+    /// await 期间不持有其他锁，复查与发布构成不可分割的原子段。
+    async fn publish_final_snapshot_if_current(&self, epoch: u64) -> bool {
+        let mut stats = self.stats.lock().await;
+        if self.start_epoch.load(Ordering::Acquire) != epoch {
+            return false;
+        }
+        // 记录进入终态的时间（供监控面板展示生命周期）
+        stats.finished_at = Some(SystemTime::now());
+        refresh_chunk_summary(&mut stats);
+        self.progress_tx.send_replace(Arc::new(stats.clone()));
+        true
     }
 
     /// 将任务标记为失败并发布最终进度快照与终止事件。
@@ -924,16 +920,7 @@ impl DownloadTask {
         // 为已在新世代下重启的任务发布进度快照或虚假的 TaskFailed 事件（订阅者
         // 会把失败归咎于健康的新下载）。复查之后到函数结束再无 await，事件发送
         // 与快照发布构成一个不可分割的原子段。
-        {
-            let mut stats = self.stats.lock().await;
-            if self.start_epoch.load(Ordering::Acquire) != epoch {
-                return;
-            }
-            // 记录进入终态的时间
-            stats.finished_at = Some(SystemTime::now());
-            refresh_chunk_summary(&mut stats);
-            self.progress_tx.send_replace(stats.clone());
-        }
+        self.publish_final_snapshot_if_current(epoch).await;
         // 同步发布失败事件（错误信息与 DownloadStatus::Failed 保持一致）
         let _ = self.event_tx.send(DownloadEvent::TaskFailed {
             task_id: self.id.to_string(),
@@ -969,16 +956,7 @@ impl DownloadTask {
 
         // 在持有 stats 锁时复查世代并同步发布（与 fail_and_notify 一致），避免
         // 「复查 epoch → 获取 stats 锁」之间被新的 start() 抢占。
-        {
-            let mut stats = self.stats.lock().await;
-            if self.start_epoch.load(Ordering::Acquire) != epoch {
-                return;
-            }
-            // 记录进入终态的时间
-            stats.finished_at = Some(SystemTime::now());
-            refresh_chunk_summary(&mut stats);
-            self.progress_tx.send_replace(stats.clone());
-        }
+        self.publish_final_snapshot_if_current(epoch).await;
     }
 
     /// 带重试地发送探测请求（`Range: bytes=0-0`），退避休眠可被暂停中断（冻结计时）、
@@ -1091,7 +1069,7 @@ impl DownloadTask {
         // 重置测速基线，避免把恢复前的历史字节计入首次速度
         self.speed_tracker.lock().reset(downloaded);
         // 通知进度订阅者恢复后的快照
-        self.progress_tx.send_replace(stats.clone());
+        self.progress_tx.send_replace(Arc::new(stats.clone()));
     }
 
     /// 从探测响应头中提取总大小和范围支持信息
@@ -1656,23 +1634,23 @@ impl DownloadTask {
                 );
             }
 
-            // 节流发布进度通知：仅在累计新增下载量达到一个比例步长时才深拷贝快照并发布，
-            // 避免每个网络块都克隆整个 chunks 列表（大文件下有显著开销）
-            let publish_step = progress_publish_step(stats.total_size);
+            // 按固定时间片发布进度通知：时间片使通知密度与网速解耦（低网速时不再
+            // 数分钟无通知）。检查与重置基准必须在同一次锁持有内完成（check-and-set
+            // 原子性）：多个分块并发运行共享 last_publish_at，拆开则同窗口内多个
+            // 工作块都会通过检查，各自深拷贝快照重复发布
             let should_publish = {
-                let mut last = self.last_progress.lock();
-                if stats.downloaded.saturating_sub(*last) >= publish_step {
-                    *last = stats.downloaded;
-                    true
-                } else {
-                    false
+                let mut last = self.last_publish_at.lock();
+                let due = last.elapsed() >= PROGRESS_PUBLISH_TICK;
+                if due {
+                    *last = Instant::now();
                 }
+                due
             };
             if should_publish {
                 // 发布前同步派生摘要字段（completed_chunks 依赖 chunks 的 completed 状态，
                 // 该状态在 download_chunk 内更新，本循环不直接改，故只在发布时刷新一次）
                 refresh_chunk_summary(&mut stats);
-                self.progress_tx.send_replace(stats.clone());
+                self.progress_tx.send_replace(Arc::new(stats.clone()));
             }
 
             // 定期保存状态（间隔随文件大小自适应）；保存时释放锁避免死锁
@@ -1976,9 +1954,12 @@ impl DownloadTask {
 
     /// 订阅下载进度：返回最新统计快照的 watch 接收端
     ///
-    /// 订阅者会立即收到当前快照，并在下载推进时收到新快照（按文件大小的固定比例
-    /// 节流发布，约每 1% 一档）。可用于替代主动轮询 [`DownloadTask::get_stats`]。
-    pub fn subscribe_progress(&self) -> watch::Receiver<DownloadStats> {
+    /// 订阅者会立即收到当前快照，并在下载推进时收到新快照（按固定时间片节流发布，
+    /// 每 250ms 至多一次；发布在每个网络块成功写入后评估，通知密度与网速无关，
+    /// 但服务器停滞/读超时/重试退避等无数据到达期间不会有新快照）。快照为
+    /// `Arc<DownloadStats>`，克隆成本可忽略。可用于替代主动轮询
+    /// [`DownloadTask::get_stats`]。
+    pub fn subscribe_progress(&self) -> watch::Receiver<Arc<DownloadStats>> {
         self.progress_tx.subscribe()
     }
 
@@ -2229,7 +2210,8 @@ pub struct DownloadManager {
     event_tx: broadcast::Sender<DownloadEvent>,
     /// 全局进度总线（watch 通道）：保存「最近一个更新过进度的任务」的快照，
     /// 由各任务的进度订阅转发而来，供 `subscribe_all_progress` 提供给订阅者。
-    progress_tx: watch::Sender<DownloadStats>,
+    /// 快照以 `Arc` 包装，转发时仅递增引用计数，无深拷贝。
+    progress_tx: watch::Sender<Arc<DownloadStats>>,
 }
 
 impl DownloadManager {
@@ -2250,7 +2232,7 @@ impl DownloadManager {
             unfinished_chunks: 0,
             completed_chunks: 0,
         };
-        let (progress_tx, _) = watch::channel(initial);
+        let (progress_tx, _) = watch::channel(Arc::new(initial));
         Self {
             tasks: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
@@ -2270,7 +2252,7 @@ impl DownloadManager {
     /// 快照携带 `task_id`，订阅者据此区分来源（`task_id` 为空表示初始占位快照）。
     /// 该流适合「活动面板」实时刷新场景；需要完整任务列表时配合
     /// [`DownloadManager::list_task_overviews`] 使用。
-    pub fn subscribe_all_progress(&self) -> watch::Receiver<DownloadStats> {
+    pub fn subscribe_all_progress(&self) -> watch::Receiver<Arc<DownloadStats>> {
         self.progress_tx.subscribe()
     }
 
@@ -2325,6 +2307,7 @@ impl DownloadManager {
         // 转发循环：任务被移除/释放、进度发送端关闭时 changed() 返回 Err，循环随之结束
         tokio::spawn(async move {
             while let Ok(()) = task_progress.changed().await {
+                // 快照本身是 Arc，直接移交引用（无深拷贝）
                 let _ = global_progress_tx.send(task_progress.borrow().clone());
             }
         });
@@ -2382,7 +2365,7 @@ impl DownloadManager {
     pub async fn subscribe_progress(
         &self,
         task_id: &str,
-    ) -> Option<watch::Receiver<DownloadStats>> {
+    ) -> Option<watch::Receiver<Arc<DownloadStats>>> {
         self.tasks
             .lock()
             .await
