@@ -265,6 +265,28 @@ async fn wait_for_terminal(
     }
 }
 
+/// 从事件流中等待终止事件（完成/失败/取消），跳过其前的生命周期事件
+/// （`TaskStarted`/`TaskPaused`/`TaskResumed`——`start()` 会先发布 `TaskStarted`）。
+/// 带超时保护，避免测试因缺陷而永久挂起。
+async fn wait_for_terminal_event(
+    events: &mut tokio::sync::broadcast::Receiver<DownloadEvent>,
+    timeout: Duration,
+) -> DownloadEvent {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let event = tokio::time::timeout(timeout, events.recv())
+            .await
+            .expect("应在超时内收到事件")
+            .expect("事件通道应正常");
+        match event {
+            DownloadEvent::TaskCompleted { .. }
+            | DownloadEvent::TaskFailed { .. }
+            | DownloadEvent::TaskCancelled { .. } => return event,
+            _ => assert!(Instant::now() < deadline, "等待终止事件超时"),
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_full_range_download_against_local_server() {
     let data = test_data(TEST_DATA_LEN);
@@ -1361,10 +1383,7 @@ async fn test_remove_task_racing_finalization_preserves_file() {
     );
 
     // 终止事件必须是 TaskCompleted（而非误发的 TaskCancelled）
-    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("应收到终止事件")
-        .expect("事件流不应关闭");
+    let event = wait_for_terminal_event(&mut events, Duration::from_secs(5)).await;
     assert_eq!(
         event,
         DownloadEvent::TaskCompleted {
@@ -2153,10 +2172,7 @@ async fn test_cancel_during_probe_backoff_stops_retries() {
     }
 
     // 终止事件应为 TaskCancelled（取消收尾），而非旧实现的 TaskFailed 误报
-    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
-        .await
-        .expect("应在超时内收到终止事件")
-        .expect("事件通道应正常");
+    let event = wait_for_terminal_event(&mut events, Duration::from_secs(5)).await;
     match event {
         DownloadEvent::TaskCancelled { task_id: id } => {
             assert_eq!(id, task_id, "取消事件应携带正确的任务 ID");
@@ -3391,11 +3407,7 @@ async fn test_subscribe_events_receives_completion() {
         .await;
     manager.start_task(&task_id).await.expect("开始下载失败");
 
-    let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .expect("应在超时内收到终止事件")
-        .expect("事件通道应正常");
-
+    let event = wait_for_terminal_event(&mut events, Duration::from_secs(10)).await;
     assert_eq!(
         event,
         DownloadEvent::TaskCompleted {
@@ -3418,11 +3430,7 @@ async fn test_subscribe_events_receives_failure() {
         .await;
     manager.start_task(&task_id).await.expect("开始下载失败");
 
-    let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .expect("应在超时内收到终止事件")
-        .expect("事件通道应正常");
-
+    let event = wait_for_terminal_event(&mut events, Duration::from_secs(10)).await;
     match event {
         DownloadEvent::TaskFailed { task_id: id, error } => {
             assert_eq!(id, task_id, "事件应携带正确的任务 ID");
@@ -3460,11 +3468,7 @@ async fn test_subscribe_events_receives_cancellation() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     manager.cancel_task(&task_id).await;
 
-    let event = tokio::time::timeout(Duration::from_secs(10), events.recv())
-        .await
-        .expect("应在超时内收到终止事件")
-        .expect("事件通道应正常");
-
+    let event = wait_for_terminal_event(&mut events, Duration::from_secs(10)).await;
     assert_eq!(
         event,
         DownloadEvent::TaskCancelled {
@@ -3492,11 +3496,7 @@ async fn test_subscribe_events_receives_mid_download_failure() {
         .await;
     manager.start_task(&task_id).await.expect("开始下载失败");
 
-    let event = tokio::time::timeout(Duration::from_secs(15), events.recv())
-        .await
-        .expect("应在超时内收到终止事件")
-        .expect("事件通道应正常");
-
+    let event = wait_for_terminal_event(&mut events, Duration::from_secs(15)).await;
     match event {
         DownloadEvent::TaskFailed { task_id: id, error } => {
             assert_eq!(id, task_id, "事件应携带正确的任务 ID");
