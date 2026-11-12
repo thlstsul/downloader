@@ -751,26 +751,32 @@ impl DownloadTask {
 
             // 尝试从状态文件恢复
             let mut is_resume = false;
-            if task.config.read().auto_resume
-                && let Ok(state) = task
-                    .load_state()
+            if task.config.read().auto_resume {
+                // 状态文件不存在是常态（首次下载，或上次已完成/取消时已清理），
+                // 静默按新下载处理；仅当文件存在但加载失败（损坏/版本不符）才记错误
+                if tokio::fs::metadata(task.get_state_file_path().await)
                     .await
-                    .inspect_err(|e| error!("从状态文件恢复失败：{e}"))
-            {
-                // 校验服务器文件大小与状态文件一致，避免服务器内容变化导致错位写入
-                if state.total_size == total_size {
-                    task.restore_state_from_file(&state).await;
+                    .is_ok()
+                    && let Ok(state) = task
+                        .load_state()
+                        .await
+                        .inspect_err(|e| error!("从状态文件恢复失败：{e}"))
+                {
+                    // 校验服务器文件大小与状态文件一致，避免服务器内容变化导致错位写入
+                    if state.total_size == total_size {
+                        task.restore_state_from_file(&state).await;
 
-                    info!("从状态文件恢复下载，已下载: {} bytes", {
-                        let stats = task.stats.lock().await;
-                        stats.downloaded
-                    });
-                    is_resume = true;
-                } else {
-                    info!(
-                        "服务器文件大小已变化（{} -> {}），丢弃旧状态重新下载",
-                        state.total_size, total_size
-                    );
+                        info!("从状态文件恢复下载，已下载: {} bytes", {
+                            let stats = task.stats.lock().await;
+                            stats.downloaded
+                        });
+                        is_resume = true;
+                    } else {
+                        info!(
+                            "服务器文件大小已变化（{} -> {}），丢弃旧状态重新下载",
+                            state.total_size, total_size
+                        );
+                    }
                 }
             }
 
