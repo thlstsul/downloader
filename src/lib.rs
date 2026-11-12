@@ -725,10 +725,8 @@ impl DownloadTask {
                 return;
             }
 
-            // 从响应头中提取文件名并设置输出路径
             task.setup_filename(response.headers(), &task.url).await;
 
-            // 解析总大小与范围支持情况
             let (total_size, supports_range) =
                 task.extract_response_info(probe_status, response.headers());
             task.supports_range.store(supports_range, Ordering::Relaxed);
@@ -743,13 +741,11 @@ impl DownloadTask {
                 None
             };
 
-            // 确保下载目录存在
             if let Err(e) = tokio::fs::create_dir_all(&task.download_dir).await {
                 task.fail_and_notify(epoch, e.into()).await;
                 return;
             }
 
-            // 尝试从状态文件恢复
             let mut is_resume = false;
             if task.config.read().auto_resume {
                 // 状态文件不存在是常态（首次下载，或上次已完成/取消时已清理），
@@ -1211,7 +1207,6 @@ impl DownloadTask {
                 .clamp(TARGET_CHUNK_SIZE, MAX_CHUNK_SIZE)
         };
 
-        // 确保块大小在合理范围内
         chunk_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
     }
 
@@ -1615,11 +1610,10 @@ impl DownloadTask {
             file.write_all(&chunk_data).await?;
             chunk.downloaded += chunk_data.len() as u64;
 
-            // 更新统计信息
             let mut stats = self.stats.lock().await;
             stats.downloaded += chunk_data.len() as u64;
 
-            // 更新块信息。stats.chunks 恒按 index 连续排列（create_chunks 从 0 递增生成；
+            // stats.chunks 恒按 index 连续排列（create_chunks 从 0 递增生成；
             // 续传恢复经 is_valid_chunks 校验 index == 迭代位置），因此可按 index 直接索引，
             // 避免对每个网络块做 O(n) 线性查找（大文件分块可达上千，逐块写放大明显）。
             // get_mut 返回 Option，防御性保留越界时的静默跳过，与原 find 语义一致。
@@ -1861,7 +1855,6 @@ impl DownloadTask {
             task_id: self.id.to_string(),
         });
 
-        // 保存暂停状态
         if let Err(e) = self.save_state().await {
             error!("保存暂停状态失败: {}", e);
         }
@@ -2734,7 +2727,6 @@ fn join_continuation_segments(params: &BTreeMap<String, String>, base: &str) -> 
 /// 从 URL 末段提取文件名（解码 URL 编码后返回，失败时返回 `None`）。
 /// 供外部（如托盘展示未解析文件名的任务）在响应头解析完成前显示可读名称。
 pub fn extract_filename_from_url(url: &str) -> Option<String> {
-    // 尝试从URL路径中提取文件名
     let parsed_url = url::Url::parse(url).ok()?;
     let path = parsed_url.path();
     let filename = path.split('/').next_back()?;

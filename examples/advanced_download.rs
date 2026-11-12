@@ -1,3 +1,8 @@
+//! 运行中动态调整配置演示：下载过程中周期性修改 speed_limit 并立即生效。
+//!
+//! 修改走 get_task_config 读当前配置 → 局部修改 → update_task_config 写回的
+//! 配对流程，而非在示例里手动维护一份可能漂移的配置副本。
+
 use downloader::{DownloadConfig, DownloadManager, DownloadStatus};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -5,7 +10,6 @@ use tokio::time::sleep;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日志
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .init();
@@ -13,10 +17,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("高级下载示例 - 动态配置修改演示");
     log::info!("==================================");
 
-    // 创建下载管理器
     let manager = DownloadManager::new();
 
-    // 初始配置
     let config = DownloadConfig {
         max_connections: 2,
         chunk_size: 512 * 1024,        // 512KB
@@ -28,7 +30,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // 添加下载任务
     let task_id = manager
         .add_task(
             "https://httpbin.org/bytes/5242880".to_string(), // 5MB 测试文件
@@ -44,7 +45,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.speed_limit.unwrap_or(0) as f64 / 1024.0
     );
 
-    // 开始下载
     if let Err(e) = manager.start_task(&task_id).await {
         log::error!("下载失败: {}", e);
         return Err(e.into());
@@ -114,7 +114,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 收尾的任务取消、删掉已完整下载的临时文件，导致最终文件丢失。
         }
 
-        // 检查任务状态
         if let Some(status) = manager.get_task_status(&task_id).await {
             match status {
                 DownloadStatus::Completed => {
@@ -134,7 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 显示最终统计信息
     if let Some(stats) = manager.get_task_stats(&task_id).await {
         log::info!("下载统计:");
         log::info!("总大小: {} bytes", stats.total_size);

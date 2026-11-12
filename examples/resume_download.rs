@@ -1,10 +1,14 @@
+//! 断点续传演示：启用 auto_resume，中途暂停一次再恢复。
+//!
+//! 暂停时任务状态（含分块进度）持久化到状态文件，恢复后从断点继续，最终
+//! 文件与源一致。退出循环同样以任务终态为准，不以大小快照判定完成。
+
 use downloader::{DownloadConfig, DownloadManager, DownloadStatus};
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日志，设置日志级别为 info
     env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
         .init();
@@ -12,10 +16,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     log::info!("断点续传示例");
     log::info!("==============");
 
-    // 创建下载管理器
     let manager = DownloadManager::new();
 
-    // 配置下载参数 - 使用较低的速度限制以便有时间观察暂停/恢复
+    // 较低的速度限制让下载窗口足够长，便于观察暂停/恢复
     let config = DownloadConfig {
         max_connections: 4,
         chunk_size: 512 * 1024,        // 512KB
@@ -27,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // 添加下载任务 - 使用 httpbin 的 5MB 测试文件（支持 Range 请求）
+    // httpbin 的 5MB 测试文件支持 Range 请求
     let download_dir = PathBuf::from(".");
     let task_id = manager
         .add_task(
@@ -46,7 +49,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("任务应存在");
 
-    // 开始下载
     if let Err(e) = manager.start_task(&task_id).await {
         log::error!("下载失败: {}", e);
         return Err(e.into());
@@ -141,7 +143,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 显示最终统计信息
     if let Some(stats) = manager.get_task_stats(&task_id).await {
         log::info!("最终统计:");
         log::info!("总大小: {} bytes", stats.total_size);

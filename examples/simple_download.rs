@@ -1,18 +1,21 @@
+//! 单次下载的最小示例：添加任务 → 订阅进度 → 等待终态 → 移除任务。
+//!
+//! 关键点：进度快照显示 downloaded == total_size 时后台任务仍在收尾，退出
+//! 循环必须以任务终态（Completed/Failed/Cancelled）为准，而非大小快照，
+//! 否则 remove_task 会中断收尾、丢掉最终文件。
+
 use downloader::{DownloadConfig, DownloadManager};
 use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 初始化日志
     env_logger::init();
 
     log::info!("开始下载示例...");
 
-    // 创建下载管理器
     let manager = DownloadManager::new();
 
-    // 配置下载参数
     let config = DownloadConfig {
         max_connections: 4,
         chunk_size: 1024 * 1024,        // 1MB
@@ -24,7 +27,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // 添加下载任务
     let task_id = manager
         .add_task(
             "https://httpbin.org/bytes/10485760".to_string(), // 10MB 测试文件
@@ -41,7 +43,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
         .expect("任务应存在");
 
-    // 开始下载
     if let Err(e) = manager.start_task(&task_id).await {
         log::error!("下载失败: {}", e);
         return Err(e.into());
