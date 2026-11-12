@@ -49,7 +49,7 @@
 //!         ) {
 //!             break;
 //!         }
-//!         tokio::time::sleep(Duration::from_millis(100)).await;
+//!         sleep(Duration::from_millis(100)).await;
 //!     }
 //! }
 //! ```
@@ -62,22 +62,35 @@
 #![deny(missing_docs)]
 
 use std::collections::{BTreeMap, HashMap};
-
+use std::env;
+use std::future::Future;
+use std::io::{Error as StdIoError, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use content_disposition::parse_content_disposition;
 use log::{error, info, warn};
-use parking_lot::RwLock;
-use reqwest::Client;
-use reqwest::header::{ACCEPT, COOKIE, HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use parking_lot::{Mutex as ParkingMutex, RwLock};
+use reqwest::header::{
+    ACCEPT, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, COOKIE, HeaderMap, HeaderValue,
+    RANGE,
+};
+use reqwest::{Client, Error as ReqwestError, RequestBuilder, Response, StatusCode};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::{Error as JsonError, from_str, to_string};
 use thiserror::Error;
+use tokio::fs::{
+    OpenOptions, create_dir_all, metadata, read_to_string, remove_file, rename, write,
+};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::spawn;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
-use tokio::task::JoinSet;
-use tokio::time::sleep;
+use tokio::task::{JoinError, JoinSet};
+use tokio::time::{sleep, timeout as tokio_timeout};
+use url::Url;
+use urlencoding::{decode, decode_binary};
 use uuid::Uuid;
 
 /// 下载器错误类型
@@ -91,16 +104,16 @@ use uuid::Uuid;
 pub enum DownloadError {
     /// 内部 Tokio 任务错误（`JoinError`），如后台任务 panic 或被 join 时出错。
     #[error("Tokio任务错误: {0}")]
-    TokioError(Arc<tokio::task::JoinError>),
-    /// 内部 HTTP 请求错误（`reqwest::Error`），如建连失败、DNS 解析失败、服务器返回异常。
+    TokioError(Arc<JoinError>),
+    /// 内部 HTTP 请求错误（`ReqwestError`），如建连失败、DNS 解析失败、服务器返回异常。
     #[error("HTTP请求错误: {0}")]
-    HttpError(Arc<reqwest::Error>),
-    /// 内部 IO 错误（`std::io::Error`），如本地文件读写失败、磁盘空间不足。
+    HttpError(Arc<ReqwestError>),
+    /// 内部 IO 错误（`StdIoError`），如本地文件读写失败、磁盘空间不足。
     #[error("IO错误: {0}")]
-    IoError(Arc<std::io::Error>),
-    /// 内部 JSON 序列化错误（`serde_json::Error`），如状态文件解析失败。
+    IoError(Arc<StdIoError>),
+    /// 内部 JSON 序列化错误（`JsonError`），如状态文件解析失败。
     #[error("JSON序列化错误: {0}")]
-    JsonError(Arc<serde_json::Error>),
+    JsonError(Arc<JsonError>),
     /// 下载被用户取消（调用 `cancel`/`cancel_task` 后产生）。
     #[error("下载被取消")]
     Cancelled,
@@ -138,33 +151,33 @@ impl DownloadError {
     }
 }
 
-// 内部错误类型（`reqwest::Error`、`JoinError` 等）不实现 `Clone`/`PartialEq`/`Eq`，
+// 内部错误类型（`ReqwestError`、`JoinError` 等）不实现 `Clone`/`PartialEq`/`Eq`，
 // 故以 `Arc` 包裹以支持存储与复制，并手动实现 `From` 转换（保持 `?`/`map_err` 兼容）。
-impl From<tokio::task::JoinError> for DownloadError {
-    fn from(e: tokio::task::JoinError) -> Self {
+impl From<JoinError> for DownloadError {
+    fn from(e: JoinError) -> Self {
         DownloadError::TokioError(Arc::new(e))
     }
 }
 
-impl From<reqwest::Error> for DownloadError {
-    fn from(e: reqwest::Error) -> Self {
+impl From<ReqwestError> for DownloadError {
+    fn from(e: ReqwestError) -> Self {
         DownloadError::HttpError(Arc::new(e))
     }
 }
 
-impl From<std::io::Error> for DownloadError {
-    fn from(e: std::io::Error) -> Self {
+impl From<StdIoError> for DownloadError {
+    fn from(e: StdIoError) -> Self {
         DownloadError::IoError(Arc::new(e))
     }
 }
 
-impl From<serde_json::Error> for DownloadError {
-    fn from(e: serde_json::Error) -> Self {
+impl From<JsonError> for DownloadError {
+    fn from(e: JsonError) -> Self {
         DownloadError::JsonError(Arc::new(e))
     }
 }
 
-// 内部错误类型（Arc 包裹的 JoinError/reqwest::Error 等）无法直接比较。旧实现
+// 内部错误类型（Arc 包裹的 JoinError/ReqwestError 等）无法直接比较。旧实现
 // `self.to_string() == other.to_string()` 在每次比较时分配两个 Display 字符串，
 // 且 `Other` 变体也要绕道 Display 往返。新实现先按变体判别：变体不同直接判不等
 // （零分配，覆盖最常见的不等情形）；变体相同再比较内部数据——`Other` 直接比字符串，
@@ -202,7 +215,7 @@ impl Eq for DownloadError {}
 impl Serialize for DownloadError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         serializer.serialize_str(&self.to_string())
     }
@@ -211,7 +224,7 @@ impl Serialize for DownloadError {
 impl<'de> Deserialize<'de> for DownloadError {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
-        D: serde::Deserializer<'de>,
+        D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
         Ok(DownloadError::Other(s))
@@ -528,7 +541,7 @@ pub enum DownloadEvent {
 /// 会把新世代的 JoinSet 误当作自己的去 abort，导致新世代分块被中止（部分文件
 /// 被重命名为最终名、静默报 Completed）。世代配对后，任何槽位操作都先校验
 /// 世代一致，过期世代对槽位操作一律跳过。
-type ActiveChunks = parking_lot::Mutex<Option<(u64, JoinSet<Result<(), DownloadError>>)>>;
+type ActiveChunks = ParkingMutex<Option<(u64, JoinSet<Result<(), DownloadError>>)>>;
 
 /// 下载任务
 ///
@@ -562,18 +575,18 @@ pub struct DownloadTask {
     start_epoch: Arc<AtomicU64>,
     supports_range: Arc<AtomicBool>,
     /// 任务启动时间（用于计算整体耗时与速度）
-    started_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+    started_at: Arc<ParkingMutex<Option<Instant>>>,
     /// 全局限速器（所有分块共享，保证总速度不超限）
     rate_limiter: Arc<RateLimiter>,
     /// 速度跟踪器
-    speed_tracker: Arc<parking_lot::Mutex<SpeedTracker>>,
+    speed_tracker: Arc<ParkingMutex<SpeedTracker>>,
     /// 状态文件写入锁：串行化并发 save_state，避免多个分块同时写坏状态文件
-    state_lock: Arc<tokio::sync::Mutex<()>>,
+    state_lock: Arc<Mutex<()>>,
     /// 进度通知源（watch 通道，订阅者获取最新统计快照；快照以 `Arc` 包装，
     /// 发布与订阅端的克隆均为廉价的引用计数递增）
     progress_tx: watch::Sender<Arc<DownloadStats>>,
     /// 上一次发布进度通知的时间（用于按固定时间片节流发布）
-    last_publish_at: Arc<parking_lot::Mutex<Instant>>,
+    last_publish_at: Arc<ParkingMutex<Instant>>,
     /// 全局事件发送端（终止时发布完成/失败/取消事件）。独立创建的任务默认指向
     /// 一个无订阅者的通道（事件静默丢弃）；由 `DownloadManager::add_task` 注入
     /// 管理器共享的事件总线，使 `subscribe_events` 能收到该任务的事件。
@@ -621,16 +634,16 @@ impl DownloadTask {
             pause_notify: Arc::new(Notify::new()),
             start_epoch: Arc::new(AtomicU64::new(0)),
             supports_range: Arc::new(AtomicBool::new(false)),
-            started_at: Arc::new(parking_lot::Mutex::new(None)),
+            started_at: Arc::new(ParkingMutex::new(None)),
             rate_limiter: Arc::new(RateLimiter::new()),
-            speed_tracker: Arc::new(parking_lot::Mutex::new(SpeedTracker::new())),
-            state_lock: Arc::new(tokio::sync::Mutex::new(())),
+            speed_tracker: Arc::new(ParkingMutex::new(SpeedTracker::new())),
+            state_lock: Arc::new(Mutex::new(())),
             progress_tx,
-            last_publish_at: Arc::new(parking_lot::Mutex::new(Instant::now())),
+            last_publish_at: Arc::new(ParkingMutex::new(Instant::now())),
             // 独立创建的任务默认无事件订阅者；`.0` 取 sender、接收端立即丢弃，
             // 此时 send 只会返回 Err 而无副作用。真正的共享总线由 add_task 注入。
             event_tx: broadcast::channel(1).0,
-            active_chunks: Arc::new(parking_lot::Mutex::new(None)),
+            active_chunks: Arc::new(ParkingMutex::new(None)),
         }
     }
 
@@ -674,7 +687,7 @@ impl DownloadTask {
         });
 
         let task = self.clone();
-        tokio::spawn(async move {
+        spawn(async move {
             let client = match task.build_client() {
                 Ok(client) => client,
                 Err(e) => {
@@ -712,9 +725,9 @@ impl DownloadTask {
             // 空文件场景：Range: bytes=0-0 不可满足，服务器返回 416，此时不应报错，
             // 而是按大小为 0、不支持范围请求处理（后续以完整 GET 下载得到 0 字节文件）
             let probe_status = response.status();
-            let is_empty_file = probe_status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE;
+            let is_empty_file = probe_status == StatusCode::RANGE_NOT_SATISFIABLE;
             if !probe_status.is_success()
-                && probe_status != reqwest::StatusCode::PARTIAL_CONTENT
+                && probe_status != StatusCode::PARTIAL_CONTENT
                 && !is_empty_file
             {
                 task.fail_and_notify(
@@ -735,13 +748,13 @@ impl DownloadTask {
             // 此时复用该响应体作为「非范围服务器」的单块下载，避免下载器发起第二次
             // 全量 GET（此前探测定会丢掉这个完整响应体、再重新下载一次，浪费一倍带宽）。
             // 仅精确匹配 200：416（空文件）与 206（`bytes 0-0/*` 未知大小）都无完整响应体，不可复用。
-            let probe_response = if !supports_range && probe_status == reqwest::StatusCode::OK {
+            let probe_response = if !supports_range && probe_status == StatusCode::OK {
                 Some(response)
             } else {
                 None
             };
 
-            if let Err(e) = tokio::fs::create_dir_all(&task.download_dir).await {
+            if let Err(e) = create_dir_all(&task.download_dir).await {
                 task.fail_and_notify(epoch, e.into()).await;
                 return;
             }
@@ -750,9 +763,7 @@ impl DownloadTask {
             if task.config.read().auto_resume {
                 // 状态文件不存在是常态（首次下载，或上次已完成/取消时已清理），
                 // 静默按新下载处理；仅当文件存在但加载失败（损坏/版本不符）才记错误
-                if tokio::fs::metadata(task.get_state_file_path().await)
-                    .await
-                    .is_ok()
+                if metadata(task.get_state_file_path().await).await.is_ok()
                     && let Ok(state) = task
                         .load_state()
                         .await
@@ -781,12 +792,12 @@ impl DownloadTask {
                 info!("初始化下载统计");
                 // 完整重新下载（非续传或服务器不支持范围）时清理旧临时文件，
                 // 避免旧文件内容大于新文件时残留多余字节
-                let _ = tokio::fs::remove_file(task.get_output_path().await).await;
+                let _ = remove_file(task.get_output_path().await).await;
                 // 同时删除过期的状态文件：其记录的分块进度对应的字节已被上面的
                 // 临时文件删除丢弃，若保留下来，将来服务器大小恢复一致时 load_state
                 // 会成功并把「已完成」分块从待下载列表过滤掉，而那些字节区在重建的
                 // 临时文件中已不存在，最终文件会在这些位置留下零填充空洞且无任何报错
-                let _ = tokio::fs::remove_file(task.get_state_file_path().await).await;
+                let _ = remove_file(task.get_state_file_path().await).await;
                 let mut stats = task.stats.lock().await;
                 stats.total_size = total_size;
                 stats.downloaded = 0;
@@ -862,14 +873,14 @@ impl DownloadTask {
             // 取消时清理残留的临时/状态文件。此时 download_chunks 已返回并 join 了
             // 所有分块（不再持有文件句柄），Windows 下删除也不会因共享冲突失败。
             if is_cancelled {
-                let _ = tokio::fs::remove_file(task.get_state_file_path().await).await;
-                let _ = tokio::fs::remove_file(task.get_output_path().await).await;
+                let _ = remove_file(task.get_state_file_path().await).await;
+                let _ = remove_file(task.get_output_path().await).await;
             } else if is_completed {
                 // 防御性清理：download_chunks 的成功路径已删除状态文件，但 pause() 的
                 // save_state 可能恰好在「download_chunks 删除状态文件之后、本任务标记
                 // Completed 之前」完成落盘（暂停与完成并发）。此时会残留一个指向已完成
                 // 分块的状态文件；这里再删一次，确保 Completed 任务不残留 `.download_state`。
-                let _ = tokio::fs::remove_file(task.get_state_file_path().await).await;
+                let _ = remove_file(task.get_state_file_path().await).await;
             }
 
             // 发布最终统计快照，确保订阅者在完成/失败/取消时收到终止信号
@@ -953,8 +964,8 @@ impl DownloadTask {
             return;
         }
         // 探测阶段尚未写入任何文件，remove_file 均为无害 no-op；防御性清理
-        let _ = tokio::fs::remove_file(self.get_state_file_path().await).await;
-        let _ = tokio::fs::remove_file(self.get_output_path().await).await;
+        let _ = remove_file(self.get_state_file_path().await).await;
+        let _ = remove_file(self.get_output_path().await).await;
 
         // 在持有 stats 锁时复查世代并同步发布（与 fail_and_notify 一致），避免
         // 「复查 epoch → 获取 stats 锁」之间被新的 start() 抢占。
@@ -973,7 +984,7 @@ impl DownloadTask {
         max_retries: u32,
         base: Duration,
         max: Duration,
-    ) -> Result<reqwest::Response, DownloadError> {
+    ) -> Result<Response, DownloadError> {
         let mut attempt = 0u32;
         loop {
             // 退避等待期间可能已发生取消/重启：发起新请求前先校验世代，
@@ -982,9 +993,7 @@ impl DownloadTask {
                 return Err(DownloadError::Cancelled);
             }
             let read_timeout = self.config.read().read_timeout;
-            let probe_request = client
-                .get(&self.url)
-                .header(reqwest::header::RANGE, "bytes=0-0");
+            let probe_request = client.get(&self.url).header(RANGE, "bytes=0-0");
             match send_request(read_timeout, probe_request).await {
                 Ok(resp) => return Ok(resp),
                 Err(e) if e.is_retryable() && attempt < max_retries => {
@@ -1081,21 +1090,17 @@ impl DownloadTask {
     /// 探测请求发送 `Range: bytes=0-0`，因此：
     /// - 206 响应：总大小在 `Content-Range: bytes 0-0/总大小` 中
     /// - 200 响应：服务器忽略 Range，总大小在 Content-Length 中，且不支持范围请求
-    fn extract_response_info(
-        &self,
-        status: reqwest::StatusCode,
-        headers: &HeaderMap,
-    ) -> (u64, bool) {
+    fn extract_response_info(&self, status: StatusCode, headers: &HeaderMap) -> (u64, bool) {
         // 空文件：Range: bytes=0-0 不可满足，服务器返回 416，按大小 0、不支持范围处理
-        if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
             return (0, false);
         }
 
         // 206 响应会携带 Content-Range 头（RFC 7233），此时 Content-Length 只是
         // 分片体长度（1 字节），不是文件总大小，不能回退读取
-        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        if status == StatusCode::PARTIAL_CONTENT {
             return match headers
-                .get(reqwest::header::CONTENT_RANGE)
+                .get(CONTENT_RANGE)
                 .and_then(|cr| cr.to_str().ok())
                 .and_then(parse_total_from_content_range)
             {
@@ -1110,7 +1115,7 @@ impl DownloadTask {
 
         // 200 响应：服务器忽略 Range，总大小在 Content-Length 中，且不支持范围请求
         let total_size = headers
-            .get(reqwest::header::CONTENT_LENGTH)
+            .get(CONTENT_LENGTH)
             .and_then(|ct_len| ct_len.to_str().ok())
             .and_then(|ct_len| ct_len.parse().ok())
             .unwrap_or(0);
@@ -1217,7 +1222,7 @@ impl DownloadTask {
     async fn download_chunks(
         &self,
         client: &Client,
-        probe_response: Option<reqwest::Response>,
+        probe_response: Option<Response>,
         epoch: u64,
     ) -> Result<(), DownloadError> {
         // 并发上限至少为 1，避免配置为 0 时没有任何分块并发导致死锁
@@ -1392,16 +1397,16 @@ impl DownloadTask {
         let to = self.download_dir.join(self.get_filename().await);
         // Windows 上 rename 无法覆盖已存在的文件，需先删除旧文件
         #[cfg(windows)]
-        if tokio::fs::metadata(&to).await.is_ok() {
-            tokio::fs::remove_file(&to).await?;
+        if metadata(&to).await.is_ok() {
+            remove_file(&to).await?;
         }
         // rename 是原子临界点：前面仍有多个 await（取文件名锁、删旧文件），
         // 最后一刻再校验一次世代，杜绝「取消后立即重启」抢占 rename 窗口。
         if self.should_stop(epoch) {
             return Err(DownloadError::Cancelled);
         }
-        tokio::fs::rename(from, to).await?;
-        let _ = tokio::fs::remove_file(self.get_state_file_path().await).await;
+        rename(from, to).await?;
+        let _ = remove_file(self.get_state_file_path().await).await;
 
         Ok(())
     }
@@ -1416,7 +1421,7 @@ impl DownloadTask {
         &self,
         client: &Client,
         mut chunk: ChunkInfo,
-        mut reused_response: Option<reqwest::Response>,
+        mut reused_response: Option<Response>,
         epoch: u64,
     ) -> Result<(), DownloadError> {
         if chunk.completed {
@@ -1480,7 +1485,7 @@ impl DownloadTask {
         client: &Client,
         chunk: &mut ChunkInfo,
         supports_range: bool,
-        reused_response: Option<reqwest::Response>,
+        reused_response: Option<Response>,
         epoch: u64,
     ) -> Result<(), DownloadError> {
         // 复用探测响应（服务器不支持范围时，探测请求已返回 200 + 全量载荷），
@@ -1493,7 +1498,7 @@ impl DownloadTask {
                 if supports_range {
                     let range_header =
                         format!("bytes={}-{}", chunk.start + chunk.downloaded, chunk.end);
-                    request = request.header(reqwest::header::RANGE, &range_header);
+                    request = request.header(RANGE, &range_header);
                 }
                 // 先拷贝 read_timeout 再 await，避免把 RwLock 读锁守卫跨 await 持有
                 let read_timeout = self.config.read().read_timeout;
@@ -1508,7 +1513,7 @@ impl DownloadTask {
             )));
         }
         // 请求了 Range 但服务器返回 200：说明服务器实际不支持分块，继续写入会损坏文件
-        if supports_range && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        if supports_range && response.status() != StatusCode::PARTIAL_CONTENT {
             return Err(DownloadError::Other(format!(
                 "分块 {} 服务器未按 Range 请求返回（可能不支持分块下载）",
                 chunk.index
@@ -1524,7 +1529,7 @@ impl DownloadTask {
         if supports_range {
             let content_range = response
                 .headers()
-                .get(reqwest::header::CONTENT_RANGE)
+                .get(CONTENT_RANGE)
                 .and_then(|value| value.to_str().ok())
                 .ok_or_else(|| {
                     DownloadError::Other(format!(
@@ -1560,7 +1565,7 @@ impl DownloadTask {
         }
 
         let output_path = self.get_output_path().await;
-        let mut file = tokio::fs::OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
@@ -1578,7 +1583,7 @@ impl DownloadTask {
         }
 
         // 块内顺序写入，定位一次即可
-        file.seek(std::io::SeekFrom::Start(chunk.start + chunk.downloaded))
+        file.seek(SeekFrom::Start(chunk.start + chunk.downloaded))
             .await?;
 
         loop {
@@ -2023,7 +2028,7 @@ impl DownloadTask {
             chunks,
         };
 
-        let state_json = serde_json::to_string(&state)?;
+        let state_json = to_string(&state)?;
 
         // 先写临时文件再原子重命名，避免进程在写入中途崩溃留下截断文件，
         // 导致断点续传读取失败。
@@ -2032,13 +2037,13 @@ impl DownloadTask {
         tmp_os.push(".tmp");
         let tmp_path = PathBuf::from(tmp_os);
 
-        tokio::fs::write(&tmp_path, &state_json).await?;
+        write(&tmp_path, &state_json).await?;
         // Windows 上 rename 无法覆盖已存在文件，需先删除旧文件
         #[cfg(windows)]
-        if tokio::fs::metadata(&state_path).await.is_ok() {
-            tokio::fs::remove_file(&state_path).await?;
+        if metadata(&state_path).await.is_ok() {
+            remove_file(&state_path).await?;
         }
-        tokio::fs::rename(&tmp_path, &state_path).await?;
+        rename(&tmp_path, &state_path).await?;
         Ok(())
     }
 
@@ -2046,12 +2051,12 @@ impl DownloadTask {
     async fn load_state(&self) -> Result<DownloadState, DownloadError> {
         let state_file_path = self.get_state_file_path().await;
         info!("加载状态文件：{:?}", state_file_path);
-        if tokio::fs::metadata(&state_file_path).await.is_err() {
+        if metadata(&state_file_path).await.is_err() {
             return Err(DownloadError::InvalidStateFile);
         }
 
-        let state_json = tokio::fs::read_to_string(&state_file_path).await?;
-        let state: DownloadState = serde_json::from_str(&state_json)?;
+        let state_json = read_to_string(&state_file_path).await?;
+        let state: DownloadState = from_str(&state_json)?;
 
         // 验证状态文件的有效性
         if state.url != self.url {
@@ -2075,7 +2080,7 @@ impl DownloadTask {
 /// 所有分块共享同一个限速器，保证下载总速度不超过配置的上限，
 /// 而不是每个分块各自限速（那样总速度会变成 上限 × 连接数）。
 struct RateLimiter {
-    state: tokio::sync::Mutex<RateLimiterState>,
+    state: Mutex<RateLimiterState>,
 }
 
 struct RateLimiterState {
@@ -2088,7 +2093,7 @@ struct RateLimiterState {
 impl RateLimiter {
     fn new() -> Self {
         Self {
-            state: tokio::sync::Mutex::new(RateLimiterState {
+            state: Mutex::new(RateLimiterState {
                 tokens: 0.0,
                 last_refill: Instant::now(),
             }),
@@ -2306,7 +2311,7 @@ impl DownloadManager {
         // 立即转发一次当前快照，使全局通道尽快反映新任务，无需等待首次进度变化
         let _ = global_progress_tx.send(task_progress.borrow().clone());
         // 转发循环：任务被移除/释放、进度发送端关闭时 changed() 返回 Err，循环随之结束
-        tokio::spawn(async move {
+        spawn(async move {
             while let Ok(()) = task_progress.changed().await {
                 // 快照本身是 Arc，直接移交引用（无深拷贝）
                 let _ = global_progress_tx.send(task_progress.borrow().clone());
@@ -2496,7 +2501,7 @@ impl DownloadManager {
                         if Instant::now() >= deadline {
                             break; // 超时兜底：视为卡住，走下方取消
                         }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        sleep(Duration::from_millis(20)).await;
                     }
                     if matches!(
                         task.get_status().await,
@@ -2511,16 +2516,16 @@ impl DownloadManager {
                         // 已进入终态：清理可能残留的临时/状态文件。Completed 时通常
                         // 已由后台清理（此处防御）；若等待期间任务以 Failed 结束，
                         // 断点续传保留的部分文件也在移除任务时一并清除。
-                        let _ = tokio::fs::remove_file(task.get_state_file_path().await).await;
-                        let _ = tokio::fs::remove_file(task.get_output_path().await).await;
+                        let _ = remove_file(task.get_state_file_path().await).await;
+                        let _ = remove_file(task.get_output_path().await).await;
                     }
                 } else {
                     task.cancel().await;
                 }
             } else {
                 // 终止状态：清理可能残留的临时/状态文件
-                let _ = tokio::fs::remove_file(task.get_state_file_path().await).await;
-                let _ = tokio::fs::remove_file(task.get_output_path().await).await;
+                let _ = remove_file(task.get_state_file_path().await).await;
+                let _ = remove_file(task.get_output_path().await).await;
             }
         }
 
@@ -2563,7 +2568,7 @@ impl Default for DownloadManager {
 /// 优先使用 `USER_AGENT` 环境变量（非空时）；否则回退到「库名/版本」。
 /// 保证返回非空值：reqwest 不会自动附带 UA，缺失该头会被部分服务器（CDN/反爬）拒绝。
 fn default_user_agent() -> String {
-    std::env::var("USER_AGENT")
+    env::var("USER_AGENT")
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
@@ -2577,10 +2582,10 @@ fn default_user_agent() -> String {
 /// 这一段，避免探测/分块请求无限等待。
 async fn send_request(
     read_timeout: Option<Duration>,
-    request: reqwest::RequestBuilder,
-) -> Result<reqwest::Response, DownloadError> {
+    request: RequestBuilder,
+) -> Result<Response, DownloadError> {
     match read_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, request.send()).await {
+        Some(timeout) => match tokio_timeout(timeout, request.send()).await {
             Ok(result) => result.map_err(DownloadError::from),
             Err(_) => Err(DownloadError::RequestTimeout),
         },
@@ -2595,10 +2600,10 @@ async fn send_request(
 /// 不会因此被中断。
 async fn next_chunk<T>(
     read_timeout: Option<Duration>,
-    chunk: impl std::future::Future<Output = Result<Option<T>, reqwest::Error>>,
+    chunk: impl Future<Output = Result<Option<T>, ReqwestError>>,
 ) -> Result<Option<T>, DownloadError> {
     match read_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, chunk).await {
+        Some(timeout) => match tokio_timeout(timeout, chunk).await {
             Ok(result) => result.map_err(DownloadError::from),
             Err(_) => Err(DownloadError::ReadTimeout),
         },
@@ -2643,15 +2648,12 @@ fn parse_content_range(value: &str) -> Option<(u64, Option<u64>)> {
 }
 
 /// 从HTTP响应头中提取文件名
-fn extract_filename_from_headers(
-    headers: &reqwest::header::HeaderMap,
-    url: &str,
-) -> Option<String> {
+fn extract_filename_from_headers(headers: &HeaderMap, url: &str) -> Option<String> {
     // 首先尝试从 Content-Disposition 头中提取文件名。
-    if let Some(content_disposition) = headers.get(reqwest::header::CONTENT_DISPOSITION)
+    if let Some(content_disposition) = headers.get(CONTENT_DISPOSITION)
         && let Ok(disposition_str) = content_disposition.to_str()
     {
-        let parsed = content_disposition::parse_content_disposition(disposition_str);
+        let parsed = parse_content_disposition(disposition_str);
 
         // RFC 6266 §4.3：扩展参数 `filename*`（可携带任意字符集，通常为 UTF-8）应
         // 优先于普通 `filename`（仅 ASCII）。`content_disposition` crate 仅在「无普通
@@ -2700,7 +2702,7 @@ fn decode_extended_filename(value: &str) -> Option<String> {
     if !charset.eq_ignore_ascii_case("utf-8") {
         return None;
     }
-    let bytes = urlencoding::decode_binary(encoded.as_bytes());
+    let bytes = decode_binary(encoded.as_bytes());
     String::from_utf8(bytes.into_owned()).ok()
 }
 
@@ -2727,7 +2729,7 @@ fn join_continuation_segments(params: &BTreeMap<String, String>, base: &str) -> 
 /// 从 URL 末段提取文件名（解码 URL 编码后返回，失败时返回 `None`）。
 /// 供外部（如托盘展示未解析文件名的任务）在响应头解析完成前显示可读名称。
 pub fn extract_filename_from_url(url: &str) -> Option<String> {
-    let parsed_url = url::Url::parse(url).ok()?;
+    let parsed_url = Url::parse(url).ok()?;
     let path = parsed_url.path();
     let filename = path.split('/').next_back()?;
     if filename.is_empty() || filename == "/" {
@@ -2735,7 +2737,7 @@ pub fn extract_filename_from_url(url: &str) -> Option<String> {
     }
 
     // 解码URL编码的文件名
-    let decoded = if let Ok(decoded) = urlencoding::decode(filename) {
+    let decoded = if let Ok(decoded) = decode(filename) {
         decoded.to_string()
     } else {
         filename.to_string()
@@ -2911,8 +2913,8 @@ mod tests {
             DownloadError::Other("y".to_string())
         );
         // 相同变体但内部错误文本不同 => 不等（Arc 包裹，退化为文本比较）
-        let io_a: DownloadError = std::io::Error::new(ErrorKind::NotFound, "a").into();
-        let io_b: DownloadError = std::io::Error::new(ErrorKind::NotFound, "b").into();
+        let io_a: DownloadError = StdIoError::new(ErrorKind::NotFound, "a").into();
+        let io_b: DownloadError = StdIoError::new(ErrorKind::NotFound, "b").into();
         assert_ne!(io_a, io_b);
         assert_eq!(io_a.clone(), io_a);
         // 不同变体 => 不等（即使 Display 文本可能相似，前缀不同不会误判）
@@ -2944,19 +2946,19 @@ mod tests {
     fn test_download_error_serde_roundtrip() {
         // 无载荷变体：序列化为 Display 文本（JSON 字符串）
         assert_eq!(
-            serde_json::to_string(&DownloadError::Cancelled).unwrap(),
-            serde_json::to_string("下载被取消").unwrap(),
+            to_string(&DownloadError::Cancelled).unwrap(),
+            to_string("下载被取消").unwrap(),
         );
         // 带载荷变体：文本拼入 Display
-        let json = serde_json::to_string(&DownloadError::Other("x".to_string())).unwrap();
-        assert_eq!(json, serde_json::to_string("其他错误: x").unwrap());
+        let json = to_string(&DownloadError::Other("x".to_string())).unwrap();
+        assert_eq!(json, to_string("其他错误: x").unwrap());
         // 反序列化恒还原为 Other(文本)——丢失原变体是文档化语义
-        let restored: DownloadError = serde_json::from_str(&json).unwrap();
+        let restored: DownloadError = from_str(&json).unwrap();
         assert_eq!(restored, DownloadError::Other("其他错误: x".to_string()));
         // DownloadStatus::Failed 整体可往返（状态文件/持久化场景）
         let status = DownloadStatus::Failed(DownloadError::RequestTimeout);
-        let status_json = serde_json::to_string(&status).unwrap();
-        match serde_json::from_str::<DownloadStatus>(&status_json).unwrap() {
+        let status_json = to_string(&status).unwrap();
+        match from_str::<DownloadStatus>(&status_json).unwrap() {
             DownloadStatus::Failed(DownloadError::Other(s)) => {
                 assert!(s.contains("请求超时"), "还原文本应含超时语义: {s}")
             }
@@ -3103,7 +3105,7 @@ mod tests {
             .await;
 
         // 订阅者应收到一次新的统计快照，而不是一直等待一个永不发出的通知
-        tokio::time::timeout(Duration::from_secs(2), progress.changed())
+        tokio_timeout(Duration::from_secs(2), progress.changed())
             .await
             .expect("前置失败后应发布最终快照")
             .expect("watch 通道不应已关闭");
@@ -3243,19 +3245,13 @@ mod tests {
 
         let temp_path = temp_dir.path().join("file.txt.temp");
         let state_path = temp_dir.path().join("file.txt.download_state");
-        tokio::fs::write(&temp_path, b"partial").await.unwrap();
-        tokio::fs::write(&state_path, "{}").await.unwrap();
+        write(&temp_path, b"partial").await.unwrap();
+        write(&state_path, "{}").await.unwrap();
 
         // 移除终止状态任务应同步清理残留的临时/状态文件（无后台分块持有句柄）
         assert!(manager.remove_task(&task_id).await);
-        assert!(
-            tokio::fs::metadata(&temp_path).await.is_err(),
-            "临时文件应被清理"
-        );
-        assert!(
-            tokio::fs::metadata(&state_path).await.is_err(),
-            "状态文件应被清理"
-        );
+        assert!(metadata(&temp_path).await.is_err(), "临时文件应被清理");
+        assert!(metadata(&state_path).await.is_err(), "状态文件应被清理");
     }
 
     #[tokio::test]
@@ -3373,7 +3369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_extract_response_info() {
-        use reqwest::StatusCode;
+        use StatusCode;
         use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderValue};
         let task = DownloadTask::new(
             "https://example.com/file.txt".to_string(),
@@ -3781,7 +3777,7 @@ mod tests {
         let mut handles = Vec::new();
         for _ in 0..4 {
             let limiter = limiter.clone();
-            handles.push(tokio::spawn(async move {
+            handles.push(spawn(async move {
                 limiter.throttle(250 * 1024, 1024 * 1024).await;
             }));
         }
@@ -4140,7 +4136,7 @@ mod tests {
         // 永不完成的 future + 极短超时，应返回读取超时错误
         let result = next_chunk(
             Some(Duration::from_millis(5)),
-            std::future::pending::<Result<Option<Vec<u8>>, reqwest::Error>>(),
+            std::future::pending::<Result<Option<Vec<u8>>, ReqwestError>>(),
         )
         .await;
         assert!(matches!(result, Err(DownloadError::ReadTimeout)));
@@ -4149,7 +4145,7 @@ mod tests {
     #[tokio::test]
     async fn test_next_chunk_returns_ready_value() {
         let result = next_chunk(Some(Duration::from_secs(1)), async {
-            Ok::<Option<Vec<u8>>, reqwest::Error>(Some(vec![1, 2, 3]))
+            Ok::<Option<Vec<u8>>, ReqwestError>(Some(vec![1, 2, 3]))
         })
         .await;
         assert_eq!(result.unwrap(), Some(vec![1, 2, 3]));
@@ -4158,7 +4154,7 @@ mod tests {
     #[tokio::test]
     async fn test_next_chunk_no_timeout_returns_value() {
         let result = next_chunk(None, async {
-            Ok::<Option<Vec<u8>>, reqwest::Error>(Some(vec![9]))
+            Ok::<Option<Vec<u8>>, ReqwestError>(Some(vec![9]))
         })
         .await;
         assert_eq!(result.unwrap(), Some(vec![9]));
@@ -4190,10 +4186,8 @@ mod tests {
         task.save_state().await.expect("保存状态应成功");
 
         let state_path = temp_dir.path().join("file.txt.download_state");
-        let raw = tokio::fs::read_to_string(&state_path)
-            .await
-            .expect("读取状态文件失败");
-        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let raw = read_to_string(&state_path).await.expect("读取状态文件失败");
+        let value: serde_json::Value = from_str(&raw).unwrap();
         // 写入的状态应包含当前版本号
         assert_eq!(value["version"].as_u64(), Some(STATE_VERSION as u64));
 
@@ -4203,9 +4197,7 @@ mod tests {
         // 版本不匹配（模拟旧/未来格式）时应拒绝加载
         let mut mismatched = value;
         mismatched["version"] = serde_json::json!(STATE_VERSION + 1);
-        tokio::fs::write(&state_path, mismatched.to_string())
-            .await
-            .unwrap();
+        write(&state_path, mismatched.to_string()).await.unwrap();
         assert!(matches!(
             task.load_state().await,
             Err(DownloadError::InvalidStateFile)
@@ -4415,7 +4407,7 @@ mod tests {
             ],
         };
         let state_path = task.get_state_file_path().await;
-        tokio::fs::write(&state_path, serde_json::to_string(&valid).unwrap())
+        write(&state_path, to_string(&valid).unwrap())
             .await
             .unwrap();
         assert!(
@@ -4443,7 +4435,7 @@ mod tests {
             ],
             ..valid
         };
-        tokio::fs::write(&state_path, serde_json::to_string(&tampered).unwrap())
+        write(&state_path, to_string(&tampered).unwrap())
             .await
             .unwrap();
         assert!(matches!(
