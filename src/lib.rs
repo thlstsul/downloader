@@ -71,7 +71,7 @@ use std::time::{Duration, Instant, SystemTime};
 use log::{error, info, warn};
 use parking_lot::RwLock;
 use reqwest::Client;
-use reqwest::header::{COOKIE, HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT, COOKIE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -1017,13 +1017,15 @@ impl DownloadTask {
     /// 构建带有配置的 HTTP 客户端
     fn build_client(&self) -> Result<Client, DownloadError> {
         let mut client_builder = Client::builder();
+        let mut default_headers = HeaderMap::new();
+        // 默认接受二进制流，避免部分服务器对未知 UA/无 Accept 头的请求返回 HTML 页面
+        default_headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
         if let Some(ref cookies) = self.config.read().cookies
             && let Ok(cookies) = HeaderValue::from_str(cookies)
         {
-            let mut cookie_header = HeaderMap::new();
-            cookie_header.insert(COOKIE, cookies);
-            client_builder = client_builder.default_headers(cookie_header);
+            default_headers.insert(COOKIE, cookies);
         }
+        client_builder = client_builder.default_headers(default_headers);
         // 始终设置非空 User-Agent：reqwest 不会自动附加 UA，未设置时部分服务器会直接拒绝。
         // 默认用「库名/版本」，可通过 USER_AGENT 环境变量覆盖，但绝不允许为空。
         client_builder = client_builder.user_agent(default_user_agent());
